@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V19", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V19.1", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -1896,7 +1896,11 @@ def _factor_relation(stock_df, factor_ret_df):
         return None
     x = _winsor(paired["factor_ret"].astype(float))
     y = _winsor(paired["stock_ret"].astype(float))
-    corr = x.corr(y, method="spearman")
+    # Spearman = Pearson correlation of ranks.
+    # Do this explicitly so Streamlit does not require scipy.stats.
+    xr = x.rank(method="average")
+    yr = y.rank(method="average")
+    corr = xr.corr(yr)
     if corr is None or not math.isfinite(float(corr)):
         return None
     n = len(paired)
@@ -2175,7 +2179,7 @@ def apply_global_catalysts(rank: pd.DataFrame, catalyst_map: dict, mode: str):
 
 
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V19")
+st.title("🎲 四时段强势回踩资金友好大师 V19.1")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
