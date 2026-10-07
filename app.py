@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V16", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V17", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -1766,7 +1766,7 @@ def apply_pts_features(rank: pd.DataFrame, pts_map: dict, mode: str):
 
 
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V16")
+st.title("🎲 四时段强势回踩资金友好大师 V17")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -1810,49 +1810,39 @@ st.markdown("### 💴 资金偏好")
 budget = st.slider("单只股票最多愿意占用多少一手资金？", 100000, 1000000, 300000, 50000, format="¥%d")
 st.caption("这里只影响合格候选之间的排序。便宜不会救活弱票；真正抓行情仍按股票代码进行。")
 
-left, middle, right = st.columns([1, 1.25, 1.75])
-with left:
-    if st.button("🚀 扫描 72 只股票", type="primary", use_container_width=True):
-        with st.spinner("正在拉取行情、计算趋势，并对前排候选精查新闻…"):
-            rank, raw, news = scan_all(STOCK_CODES)
-            if mode in ["盘中", "收盘前大引不成"]:
-                intra = download_intraday(tuple(STOCK_CODES))
-                rank = apply_intraday_features(rank, intra)
-            st.session_state.scan = rank
-            st.session_state.raw = raw
-            st.session_state.news = news
-            st.session_state.scan_mode = mode
-            if mode in ["收盘后预测明天", "开盘前"] and _current_pts_session_start() is not None:
-                st.session_state.pts_map = fetch_pts_universe(tuple(STOCK_CODES))
-                st.session_state.pts_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
-            else:
-                st.session_state.pts_map = None
-                st.session_state.pts_fetch_time = None
-            # New scan invalidates old calibration because the current feature point changed.
-            st.session_state.bt_map = None
-            st.session_state.bt_case_count = 0
-            st.session_state.bt_time = None
-with middle:
-    if st.button("🧪 一键回测 + 自动校准", use_container_width=True):
-        with st.spinner("正在自动建立历史样本、寻找相似结构并做无未来泄漏校准…"):
-            if st.session_state.scan is None:
-                rank0, raw0, news0 = scan_all(STOCK_CODES)
-                if mode in ["盘中", "收盘前大引不成"]:
-                    intra0 = download_intraday(tuple(STOCK_CODES))
-                    rank0 = apply_intraday_features(rank0, intra0)
-                st.session_state.scan = rank0
-                st.session_state.raw = raw0
-                st.session_state.news = news0
-                st.session_state.scan_mode = mode
-                if mode in ["收盘后预测明天", "开盘前"] and _current_pts_session_start() is not None:
-                    st.session_state.pts_map = fetch_pts_universe(tuple(STOCK_CODES))
-                    st.session_state.pts_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
-            bt_map, bt_n = run_one_click_backtest(st.session_state.raw or {})
-            st.session_state.bt_map = bt_map
-            st.session_state.bt_case_count = bt_n
-            st.session_state.bt_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
-with right:
-    st.caption(f"当前模式：{mode}。回测按钮会自动处理个股自身历史 + 全股票池相似结构，不需要你选参数。历史结果只做有限校准，不会盖过实时走势和新闻。")
+
+if st.button("🧠 全自动分析", type="primary", use_container_width=True):
+    with st.spinner("正在自动扫描行情、新闻、PTS、技术结构、历史回测和相似案例，并生成最终结论…"):
+        # 1) Current market scan
+        rank0, raw0, news0 = scan_all(STOCK_CODES)
+
+        # 2) Intraday structure when relevant
+        if mode in ["盘中", "收盘前大引不成"]:
+            intra0 = download_intraday(tuple(STOCK_CODES))
+            rank0 = apply_intraday_features(rank0, intra0)
+
+        st.session_state.scan = rank0
+        st.session_state.raw = raw0
+        st.session_state.news = news0
+        st.session_state.scan_mode = mode
+
+        # 3) Night PTS, only when relevant for next-session decisions
+        if mode in ["收盘后预测明天", "开盘前"] and _current_pts_session_start() is not None:
+            st.session_state.pts_map = fetch_pts_universe(tuple(STOCK_CODES))
+            st.session_state.pts_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+        else:
+            st.session_state.pts_map = None
+            st.session_state.pts_fetch_time = None
+
+        # 4) One-click historical backtest + similarity calibration
+        bt_map, bt_n = run_one_click_backtest(raw0 or {})
+        st.session_state.bt_map = bt_map
+        st.session_state.bt_case_count = bt_n
+        st.session_state.bt_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+
+st.caption(
+    f"当前模式：{mode}。只要点一次『全自动分析』，网站会自动完成行情、新闻、PTS、技术面、回测、相似案例和风险过滤，最后直接给推荐。"
+)
 
 rank = st.session_state.scan
 raw_map = st.session_state.raw or {}
@@ -1880,6 +1870,31 @@ if rank is not None and not rank.empty:
     heading = {"开盘前":"今天开盘前优先盯谁", "盘中":"盘中现在优先看谁", "收盘前大引不成":"收盘前大引不成优先候选", "收盘后预测明天":"明天优先观察谁"}[mode]
     st.subheader(heading)
     top = rank.iloc[0].copy()
+
+
+    st.markdown("### ✅ 最终结论")
+    final_label = stock_label(str(top["代码"]))
+    final_grade = str(top.get("结论", "—"))
+    hist_state = str(top.get("历史状态", "未回测"))
+    pts_state = str(top.get("PTS状态", "—"))
+    news_state = str(top.get("新闻判断", "—"))
+    risk_label = str(top.get("风险标签", "—"))
+
+    if final_grade.startswith("A"):
+        st.success(
+            f"**首选：{final_label}**｜{final_grade}｜综合分 {safe_float(top.get('综合分')):.1f}\n\n"
+            f"历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
+        )
+    elif final_grade.startswith("B+"):
+        st.warning(
+            f"**优先观察：{final_label}**｜{final_grade}｜综合分 {safe_float(top.get('综合分')):.1f}\n\n"
+            f"还差一次明确转强确认。历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
+        )
+    else:
+        st.info(
+            f"**当前没有很强的买点。排名第一：{final_label}**｜{final_grade}｜综合分 {safe_float(top.get('综合分')):.1f}\n\n"
+            f"不要为了必须买而硬买。历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
+        )
     top_ns, top_news_label, top_news_items = force_news_check(str(top["代码"]))
     top["新闻分"] = top_ns
     top["新闻判断"] = top_news_label
@@ -1896,6 +1911,7 @@ if rank is not None and not rank.empty:
     st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
 
     if st.session_state.bt_map:
+        st.caption("下面是辅助细节；如果你只想要结论，看上面的最终结论和止盈计划即可。")
         st.markdown("#### 🧪 一键历史回测校准")
         b1,b2,b3,b4,b5,b6 = st.columns(6)
         b1.metric("历史状态", str(top.get("历史状态","—")))
