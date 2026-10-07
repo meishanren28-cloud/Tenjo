@@ -15,8 +15,9 @@ import requests
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+import json
 
-st.set_page_config(page_title="四时段强势回踩大师 V20.2", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V20.4", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -284,7 +285,7 @@ def reward_risk_proxy(from_h20, support_gap, pullback_quality):
 def affordability_score(price, budget=300000):
     """Capital friendliness for a standard 100-share cash lot.
 
-    V20.2: moderately stronger than before and relative to the user's actual budget.
+    V20.4: moderately stronger than before and relative to the user's actual budget.
     Cheapness can separate otherwise comparable candidates, but never rescues a weak stock.
     Maximum bonus is 14 points.
     """
@@ -2192,8 +2193,8 @@ def apply_global_catalysts(rank: pd.DataFrame, catalyst_map: dict, mode: str):
 
 
 
-# ---------- V20.2: frozen Top5 predictions / pullback plans / optional persistent memory ----------
-MODEL_VERSION = "V20.2.1"
+# ---------- V20.4: frozen Top5 predictions / pullback plans / optional persistent memory ----------
+MODEL_VERSION = "V20.4.1"
 
 def prediction_validation_rule(mode: str) -> str:
     return {
@@ -2432,7 +2433,7 @@ def load_recent_predictions_supabase(limit=100):
 
 
 
-# ---------- V20.2: upload yesterday's frozen CSV and grade it automatically ----------
+# ---------- V20.4: upload yesterday's frozen CSV and grade it automatically ----------
 def _parse_jst_time(s):
     try:
         s = str(s).replace(" JST","")
@@ -2637,7 +2638,7 @@ def verify_prediction_csv(uploaded_file):
     required = ["预测时间","模式","排名","代码","预测价格","第一止盈","强势目标","失效位"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        return None, "不是V20/V20.2预测CSV，缺少：" + "、".join(missing)
+        return None, "不是V20/V20.4预测CSV，缺少：" + "、".join(missing)
 
     results = []
     for _, row in df.iterrows():
@@ -2673,7 +2674,7 @@ def buy_action_from_plan(row):
 
 
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V20.2")
+st.title("🎲 四时段强势回踩资金友好大师 V20.4")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -2842,29 +2843,48 @@ if rank is not None and not rank.empty:
     top_ns, top_news_label, top_news_items = force_news_check(str(top["代码"]))
     top["新闻分"] = top_ns
     top["新闻判断"] = top_news_label
-    c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
-    c1.metric("第一名", stock_label(str(top["代码"])))
-    c2.metric(f"{mode}分", format_num(top["综合分"],1))
-    c3.metric("背景 / 触发", f"{format_num(top['背景分'],0)} / {format_num(top['触发分'],0)}")
-    c4.metric("一手资金", f"¥{top['一手资金']:,.0f}" if math.isfinite(top['一手资金']) else "—")
-    c5.metric("结论", top["结论"])
-    if math.isfinite(safe_float(top.get("PTS涨跌%"))):
-        c6.metric("夜间PTS", f"{format_num(top.get('PTS涨跌%'))}%", help=str(top.get("PTS状态","")))
-    else:
-        c6.metric("夜间PTS", "—")
-    c7.metric("海外催化", f"{format_num(top.get('海外催化分'),1)}", help=f"{top.get('海外催化明细','—')}\n最新数据：{top.get('海外最新数据时间','—')}")
+    _pts_txt = f"{format_num(top.get('PTS涨跌%'))}%" if math.isfinite(safe_float(top.get("PTS涨跌%"))) else "—"
+    _lot_txt = f"¥{top['一手资金']:,.0f}" if math.isfinite(top['一手资金']) else "—"
+    summary_df = pd.DataFrame([{
+        "首选": stock_label(str(top["代码"])),
+        "综合分": format_num(top["综合分"],1),
+        "背景/触发": f"{format_num(top['背景分'],0)} / {format_num(top['触发分'],0)}",
+        "一手资金": _lot_txt,
+        "结论": top["结论"],
+        "夜间PTS": _pts_txt,
+        "海外催化": format_num(top.get("海外催化分"),1),
+    }])
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
     st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
     st.caption(f"海外关联：{top.get('海外催化明细','未发现足够可靠且新鲜的海外关联信号')}")
 
     # Direct buy plan for the recommended No.1 name.
     top_buy = buy_action_from_plan(top)
-    st.markdown("### 💰 第一名怎么买")
-    b1,b2,b3,b4 = st.columns(4)
-    b1.metric("当前价", f"¥{top_buy['当前价']:.0f}" if math.isfinite(top_buy["当前价"]) else "—")
-    b2.metric("建议买入区间", f"¥{top_buy['回踩下沿']:.0f} ～ ¥{top_buy['回踩上沿']:.0f}" if math.isfinite(top_buy["回踩下沿"]) else "—")
-    b3.metric("动作", top_buy["动作"])
-    b4.metric("失效位", f"¥{top_buy['失效位']:.0f}" if math.isfinite(top_buy["失效位"]) else "—")
-    st.caption(f"计划类型：{top_buy['类型']}｜{top_buy['说明']}")
+    st.markdown("#### 💰 第一名怎么买")
+
+    _cur_txt = f"¥{top_buy['当前价']:.0f}" if math.isfinite(top_buy["当前价"]) else "—"
+    _zone_txt = (
+        f"¥{top_buy['回踩下沿']:.0f} ～ ¥{top_buy['回踩上沿']:.0f}"
+        if math.isfinite(top_buy["回踩下沿"]) and math.isfinite(top_buy["回踩上沿"]) else "—"
+    )
+    _invalid_txt = f"¥{top_buy['失效位']:.0f}" if math.isfinite(top_buy["失效位"]) else "—"
+
+    b1,b2,b3 = st.columns([1,1.6,1])
+    b1.markdown("**当前价**<br>" + _cur_txt, unsafe_allow_html=True)
+    b2.markdown("**建议买入区间**<br>" + _zone_txt, unsafe_allow_html=True)
+    b3.markdown("**失效位**<br>" + _invalid_txt, unsafe_allow_html=True)
+
+    if top_buy["动作"].startswith("✅"):
+        _action_text = f"✅ **现在可买**：当前价 {_cur_txt} 已在建议买入区间 {_zone_txt} 内。"
+    elif top_buy["动作"].startswith("⏳"):
+        _action_text = f"⏳ **先等回踩**：等价格回到 **{_zone_txt}** 再考虑，不建议在当前价 {_cur_txt} 直接追。"
+    elif top_buy["动作"].startswith("⚠️"):
+        _action_text = f"⚠️ **先别接**：价格已经跌破原计划买入区 {_zone_txt}，先观察能否重新稳住。"
+    else:
+        _action_text = f"**动作**：{top_buy['动作']}"
+
+    st.markdown(_action_text)
+    st.caption(f"{top_buy['类型']}｜{top_buy['说明']}")
 
     # Freeze Top5 only for an explicit full-analysis click in this mode.
     _run_id = st.session_state.analysis_run_id
@@ -2876,7 +2896,7 @@ if rank is not None and not rank.empty:
             )
         snap = st.session_state.prediction_snapshots[_run_id]
 
-        st.markdown("### 🏆 本模式 Top 5｜冻结预测")
+        st.markdown("#### 🏆 本模式 Top 5｜冻结预测")
         st.caption(f"预测时间：{_analysis_time}｜{prediction_validation_rule(mode)}")
         top5_cols = [
             "排名","代码","日文名","中文名","预测价格","综合分","结论",
