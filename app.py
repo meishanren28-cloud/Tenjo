@@ -1,4 +1,5 @@
 import math
+import io
 import html as html_lib
 import re
 import time
@@ -15,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V19.2", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V20.1", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -283,7 +284,7 @@ def reward_risk_proxy(from_h20, support_gap, pullback_quality):
 def affordability_score(price, budget=300000):
     """Capital friendliness for a standard 100-share cash lot.
 
-    V19.2: moderately stronger than before and relative to the user's actual budget.
+    V20.1: moderately stronger than before and relative to the user's actual budget.
     Cheapness can separate otherwise comparable candidates, but never rescues a weak stock.
     Maximum bonus is 14 points.
     """
@@ -2190,8 +2191,463 @@ def apply_global_catalysts(rank: pd.DataFrame, catalyst_map: dict, mode: str):
     return r
 
 
+
+# ---------- V20.1: frozen Top5 predictions / pullback plans / optional persistent memory ----------
+MODEL_VERSION = "V20.1.1"
+
+def prediction_validation_rule(mode: str) -> str:
+    return {
+        "开盘前": "验证当日开盘后→收盘；记录最高/最低/收盘、是否到止盈/失效位",
+        "盘中": "只验证预测时间之后→当日收盘；预测前高点不算成绩",
+        "收盘前大引不成": "验证下一交易日；记录最高/最低/收盘、止盈/失效",
+        "收盘后预测明天": "验证下一交易日；记录最高/最低/收盘、止盈/失效",
+    }.get(mode, "按下一交易阶段验证")
+
+def pullback_buy_plan(row):
+    """Create a pre-committed pullback zone using only information already visible now.
+    This is especially useful for true breakout names that are strong but too extended to chase blindly.
+    """
+    current = safe_float(row.get("盘中现价", np.nan))
+    if not math.isfinite(current):
+        current = safe_float(row.get("现价", np.nan))
+    if not math.isfinite(current) or current <= 0:
+        return {"类型":"无数据","回踩下沿":np.nan,"回踩上沿":np.nan,"回踩中心":np.nan,"失效位":np.nan,"说明":"—"}
+
+    atr_pct = safe_float(row.get("ATR14%", np.nan))
+    atr_abs = current * atr_pct / 100.0 if math.isfinite(atr_pct) and atr_pct > 0 else current * 0.035
+    atr_abs = max(atr_abs, current * 0.015)
+
+    support = safe_float(row.get("关键支撑", np.nan))
+    ma5 = safe_float(row.get("MA5", np.nan))
+    ma20 = safe_float(row.get("MA20", np.nan))
+    dayp = safe_float(row.get("盘中涨跌%", row.get("日涨跌%", np.nan)))
+    chase_ok = bool(row.get("追强资格", False))
+    chase_score = safe_float(row.get("追强分", np.nan))
+    bg = safe_float(row.get("背景分", np.nan))
+    pull = safe_float(row.get("回调质量分", np.nan))
+
+    is_breakout = chase_ok or (math.isfinite(chase_score) and chase_score >= 42) or (
+        math.isfinite(dayp) and dayp >= 6 and math.isfinite(bg) and bg >= 25
+    )
+
+    # Candidate structural anchors already below price.
+    anchors = []
+    for name, v in [("MA5", ma5), ("关键支撑", support), ("MA20", ma20)]:
+        if math.isfinite(v) and current * 0.82 <= v < current * 0.998:
+            anchors.append((name, v))
+
+    if is_breakout:
+        # Do not require a strong stock to become "cheap"; target a normal 0.25~0.70 ATR digestion.
+        floor = current - 0.70 * atr_abs
+        ceiling = current - 0.25 * atr_abs
+        structural = max([v for _,v in anchors], default=current - 0.45 * atr_abs)
+        center = min(ceiling, max(floor, structural))
+        low = center - 0.12 * atr_abs
+        high = center + 0.12 * atr_abs
+        plan_type = "强势突破回踩"
+        note = "真突破/高位强势票：不因价格高自动否决，优先等正常回踩而不是盲目追最高点"
+    else:
+        # For normal pullback candidates, lean closer to support/short MA.
+        structural = max([v for _,v in anchors], default=current - 0.30 * atr_abs)
+        center = min(current - 0.10 * atr_abs, max(current - 0.55 * atr_abs, structural))
+        low = center - 0.10 * atr_abs
+        high = center + 0.10 * atr_abs
+        plan_type = "回调埋伏" if math.isfinite(pull) and pull >= 10 else "观察回踩"
+        note = "普通候选：回踩区间只作预先计划，不能等跌破结构后再改口说是低吸"
+
+    if math.isfinite(support):
+        low = max(low, support * 0.995)
+        # Invalidation is intentionally below the support visible at prediction time.
+        invalid = support - 0.22 * atr_abs
+    else:
+        invalid = center - 0.85 * atr_abs
+
+    # Keep zone logical and below current.
+    high = min(high, current * 0.997)
+    low = min(low, high)
+    center = (low + high) / 2.0
+
+    return {
+        "类型":plan_type,
+        "回踩下沿":float(low),
+        "回踩上沿":float(high),
+        "回踩中心":float(center),
+        "失效位":float(invalid),
+        "说明":note,
+    }
+
+def build_top5_snapshot(rank: pd.DataFrame, mode: str, run_id: str, analysis_time: str) -> pd.DataFrame:
+    rows = []
+    for pos, (_, r) in enumerate(rank.head(5).iterrows(), start=1):
+        price = safe_float(r.get("盘中现价", np.nan))
+        if not math.isfinite(price):
+            price = safe_float(r.get("现价", np.nan))
+        tp = take_profit_targets(r, price if math.isfinite(price) else None)
+        pb = pullback_buy_plan(r)
+
+        # Freeze the important features too, so tomorrow's explanation cannot silently change.
+        frozen = {
+            "背景分": safe_float(r.get("背景分")),
+            "触发分": safe_float(r.get("触发分")),
+            "回调质量分": safe_float(r.get("回调质量分")),
+            "安全回调分": safe_float(r.get("安全回调分")),
+            "空间盈亏比分": safe_float(r.get("空间盈亏比分")),
+            "ATR14%": safe_float(r.get("ATR14%")),
+            "5日%": safe_float(r.get("5日%")),
+            "20日%": safe_float(r.get("20日%")),
+            "距20日高%": safe_float(r.get("距20日高%")),
+            "距支撑%": safe_float(r.get("距支撑%")),
+            "量比20日": safe_float(r.get("量比20日")),
+            "结构持续分": safe_float(r.get("结构持续分")),
+            "近10日冲高保留率%": safe_float(r.get("近10日冲高保留率%")),
+            "冲高失败次数": safe_float(r.get("冲高失败次数")),
+            "风险总惩罚": safe_float(r.get("风险总惩罚")),
+            "追强资格": bool(r.get("追强资格", False)),
+            "追强分": safe_float(r.get("追强分")),
+            "资金友好分": safe_float(r.get("资金友好分")),
+            "一手资金": safe_float(r.get("一手资金")),
+            "PTS涨跌%": safe_float(r.get("PTS涨跌%")),
+            "PTS可信度%": safe_float(r.get("PTS可信度%")),
+            "海外催化分": safe_float(r.get("海外催化分")),
+            "历史校准分": safe_float(r.get("历史校准分")),
+            "次日上涨概率%": safe_float(r.get("次日上涨概率%")),
+            "3日延续概率%": safe_float(r.get("3日延续概率%")),
+            "3日假突破风险%": safe_float(r.get("3日假突破风险%")),
+        }
+
+        rows.append({
+            "模型版本": MODEL_VERSION,
+            "run_id": run_id,
+            "预测时间": analysis_time,
+            "模式": mode,
+            "验证规则": prediction_validation_rule(mode),
+            "排名": pos,
+            "代码": str(r.get("代码","")),
+            "日文名": str(r.get("日文名","")),
+            "中文名": str(r.get("中文名","")),
+            "预测价格": price,
+            "综合分": safe_float(r.get("综合分")),
+            "结论": str(r.get("结论","")),
+            "风险": str(r.get("风险标签","")),
+            "新闻": str(r.get("新闻判断","")),
+            "海外催化": str(r.get("海外催化状态","")),
+            "历史状态": str(r.get("历史状态","")),
+            "买入计划类型": pb["类型"],
+            "回踩买入下沿": pb["回踩下沿"],
+            "回踩买入上沿": pb["回踩上沿"],
+            "回踩买入中心": pb["回踩中心"],
+            "失效位": pb["失效位"],
+            "第一止盈": safe_float(tp.get("第一止盈")),
+            "强势目标": safe_float(tp.get("强势续抱目标")),
+            "冻结指标JSON": json.dumps(frozen, ensure_ascii=False, allow_nan=False) if all(
+                not (isinstance(v, float) and math.isnan(v)) for v in frozen.values()
+            ) else json.dumps({k:(None if isinstance(v,float) and math.isnan(v) else v) for k,v in frozen.items()}, ensure_ascii=False),
+        })
+    return pd.DataFrame(rows)
+
+def _db_secret():
+    """Prefer Supabase's current server-side secret key; support legacy service_role during migration."""
+    try:
+        return st.secrets.get("SUPABASE_SECRET_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    except Exception:
+        return None
+
+def _db_url():
+    try:
+        return st.secrets.get("SUPABASE_URL")
+    except Exception:
+        return None
+
+def supabase_configured():
+    return bool(_db_url() and _db_secret())
+
+def save_predictions_supabase(snapshot: pd.DataFrame):
+    if snapshot is None or snapshot.empty or not supabase_configured():
+        return False, "未配置Supabase"
+    base = str(_db_url()).rstrip("/")
+    key = str(_db_secret())
+    url = base + "/rest/v1/predictions?on_conflict=run_id,rank_no"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+
+    def num(v):
+        x = safe_float(v)
+        return float(x) if math.isfinite(x) else None
+
+    payload = []
+    for _, r in snapshot.iterrows():
+        payload.append({
+            "model_version": str(r["模型版本"]),
+            "run_id": str(r["run_id"]),
+            "analysis_time": str(r["预测时间"]),
+            "mode": str(r["模式"]),
+            "validation_rule": str(r["验证规则"]),
+            "rank_no": int(r["排名"]),
+            "code": str(r["代码"]),
+            "jp_name": str(r["日文名"]),
+            "cn_name": str(r["中文名"]),
+            "price": num(r["预测价格"]),
+            "score": num(r["综合分"]),
+            "grade": str(r["结论"]),
+            "risk": str(r["风险"]),
+            "news": str(r["新闻"]),
+            "global_catalyst": str(r["海外催化"]),
+            "history_state": str(r["历史状态"]),
+            "plan_type": str(r["买入计划类型"]),
+            "buy_zone_low": num(r["回踩买入下沿"]),
+            "buy_zone_high": num(r["回踩买入上沿"]),
+            "buy_zone_center": num(r["回踩买入中心"]),
+            "invalidation": num(r["失效位"]),
+            "tp1": num(r["第一止盈"]),
+            "tp2": num(r["强势目标"]),
+            "features": json.loads(str(r["冻结指标JSON"])),
+        })
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if 200 <= resp.status_code < 300:
+            return True, "已保存"
+        return False, f"HTTP {resp.status_code}: {resp.text[:160]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+def load_recent_predictions_supabase(limit=100):
+    if not supabase_configured():
+        return pd.DataFrame()
+    base = str(_db_url()).rstrip("/")
+    key = str(_db_secret())
+    url = base + f"/rest/v1/predictions?select=*&order=analysis_time.desc,rank_no.asc&limit={int(limit)}"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if 200 <= resp.status_code < 300:
+            return pd.DataFrame(resp.json())
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+
+# ---------- V20.1: upload yesterday's frozen CSV and grade it automatically ----------
+def _parse_jst_time(s):
+    try:
+        s = str(s).replace(" JST","")
+        ts = pd.Timestamp(s)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Tokyo")
+        else:
+            ts = ts.tz_convert("Asia/Tokyo")
+        return ts
+    except Exception:
+        return None
+
+def _next_jp_trading_day(code: str, after_date):
+    ticker = f"{code}.T" if str(code).isdigit() else f"{code}.T"
+    try:
+        d = yf.download(ticker, start=str(pd.Timestamp(after_date).date()),
+                        end=str((pd.Timestamp(after_date) + pd.Timedelta(days=10)).date()),
+                        interval="1d", auto_adjust=False, progress=False, threads=False)
+        if d is None or d.empty:
+            return None
+        idx = pd.to_datetime(d.index)
+        for x in idx:
+            if pd.Timestamp(x).date() > pd.Timestamp(after_date).date():
+                return pd.Timestamp(x).date()
+    except Exception:
+        return None
+    return None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_daily_for_verify(code: str, start_date: str, end_date: str):
+    ticker = f"{code}.T"
+    try:
+        d = yf.download(ticker, start=start_date, end=end_date,
+                        interval="1d", auto_adjust=False,
+                        progress=False, threads=False, timeout=20)
+        if isinstance(d.columns, pd.MultiIndex):
+            # yfinance may return ticker level even for one symbol
+            try:
+                d.columns = d.columns.get_level_values(0)
+            except Exception:
+                pass
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday_for_verify(code: str, period="10d"):
+    ticker = f"{code}.T"
+    try:
+        d = yf.download(ticker, period=period, interval="5m",
+                        auto_adjust=False, progress=False,
+                        threads=False, timeout=20)
+        if isinstance(d.columns, pd.MultiIndex):
+            try:
+                d.columns = d.columns.get_level_values(0)
+            except Exception:
+                pass
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+def _one_day_ohlc(daily_df, target_date):
+    if daily_df is None or daily_df.empty:
+        return None
+    idx = pd.to_datetime(daily_df.index)
+    mask = [pd.Timestamp(x).date() == pd.Timestamp(target_date).date() for x in idx]
+    if not any(mask):
+        return None
+    row = daily_df.loc[mask].iloc[0]
+    def g(k):
+        try:
+            v = row[k]
+            if hasattr(v, "iloc"):
+                v = v.iloc[0]
+            return float(v)
+        except Exception:
+            return np.nan
+    return {"open":g("Open"), "high":g("High"), "low":g("Low"), "close":g("Close")}
+
+def _intraday_after_prediction(code, pred_ts):
+    d = fetch_intraday_for_verify(code, "10d")
+    if d is None or d.empty:
+        return None
+    idx = pd.to_datetime(d.index)
+    # yfinance JP intraday index is usually tz-aware; normalize to JST
+    try:
+        if idx.tz is None:
+            idx = idx.tz_localize("Asia/Tokyo")
+        else:
+            idx = idx.tz_convert("Asia/Tokyo")
+    except Exception:
+        pass
+    d = d.copy()
+    d.index = idx
+    same = d[(d.index.date == pred_ts.date()) & (d.index >= pred_ts)]
+    if same.empty:
+        return None
+    def col(name):
+        s = same[name]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:,0]
+        return pd.to_numeric(s, errors="coerce")
+    return {
+        "open": float(col("Open").dropna().iloc[0]),
+        "high": float(col("High").max()),
+        "low": float(col("Low").min()),
+        "close": float(col("Close").dropna().iloc[-1]),
+    }
+
+def grade_prediction_row(r):
+    code = str(r.get("代码","")).strip()
+    mode = str(r.get("模式","")).strip()
+    pred_ts = _parse_jst_time(r.get("预测时间",""))
+    price = safe_float(r.get("预测价格"))
+    tp1 = safe_float(r.get("第一止盈"))
+    tp2 = safe_float(r.get("强势目标"))
+    invalid = safe_float(r.get("失效位"))
+    buy_low = safe_float(r.get("回踩买入下沿"))
+    buy_high = safe_float(r.get("回踩买入上沿"))
+
+    if pred_ts is None or not code or not math.isfinite(price) or price <= 0:
+        return {"验证状态":"无法验证","验证说明":"预测时间/代码/预测价格缺失"}
+
+    if mode == "盘中":
+        ohlc = _intraday_after_prediction(code, pred_ts)
+        eval_date = pred_ts.date()
+    else:
+        if mode == "开盘前":
+            eval_date = pred_ts.date()
+        else:
+            eval_date = _next_jp_trading_day(code, pred_ts.date())
+
+        if eval_date is None:
+            return {"验证状态":"未到验证日","验证说明":"下一交易日尚无可用行情"}
+
+        start = str(pd.Timestamp(eval_date).date())
+        end = str((pd.Timestamp(eval_date) + pd.Timedelta(days=2)).date())
+        daily = fetch_daily_for_verify(code, start, end)
+        ohlc = _one_day_ohlc(daily, eval_date)
+
+    if not ohlc:
+        return {"验证状态":"未到验证日/无行情","验证说明":"Yahoo暂未返回对应交易日行情"}
+
+    high, low, close, opn = ohlc["high"], ohlc["low"], ohlc["close"], ohlc["open"]
+    max_up = (high / price - 1) * 100 if math.isfinite(high) else np.nan
+    max_down = (low / price - 1) * 100 if math.isfinite(low) else np.nan
+    close_ret = (close / price - 1) * 100 if math.isfinite(close) else np.nan
+
+    buy_touch = (
+        math.isfinite(buy_low) and math.isfinite(buy_high) and
+        math.isfinite(low) and math.isfinite(high) and
+        low <= buy_high and high >= buy_low
+    )
+    tp1_hit = math.isfinite(tp1) and math.isfinite(high) and high >= tp1
+    tp2_hit = math.isfinite(tp2) and math.isfinite(high) and high >= tp2
+    invalid_hit = math.isfinite(invalid) and math.isfinite(low) and low <= invalid
+
+    # Pre-committed grading, no after-the-fact explanations.
+    if invalid_hit and not tp1_hit:
+        result = "❌ 失败"
+    elif tp1_hit and not invalid_hit:
+        result = "✅ 成功"
+    elif tp1_hit and invalid_hit:
+        result = "🟡 路径混乱"
+    elif math.isfinite(close_ret) and close_ret >= 2:
+        result = "✅ 偏成功"
+    elif math.isfinite(close_ret) and close_ret <= -3:
+        result = "❌ 偏失败"
+    else:
+        result = "🟡 一般"
+
+    rebound = np.nan
+    if math.isfinite(low) and low > 0 and math.isfinite(close):
+        rebound = (close / low - 1) * 100
+
+    return {
+        "验证状态":"已验证",
+        "验证日期":str(eval_date),
+        "实际开盘":opn,
+        "实际最高":high,
+        "实际最低":low,
+        "实际收盘":close,
+        "最大浮盈%":max_up,
+        "最大浮亏%":max_down,
+        "收盘收益%":close_ret,
+        "回踩买入区间触及":bool(buy_touch),
+        "第一止盈命中":bool(tp1_hit),
+        "强势目标命中":bool(tp2_hit),
+        "失效位触及":bool(invalid_hit),
+        "低点后收盘反弹%":rebound,
+        "判卷结果":result,
+        "验证说明":"按冻结预测参数自动判卷",
+    }
+
+def verify_prediction_csv(uploaded_file):
+    try:
+        data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        df = pd.read_csv(io.BytesIO(data), dtype={"代码":str})
+    except Exception as e:
+        return None, f"CSV读取失败：{type(e).__name__}"
+
+    required = ["预测时间","模式","排名","代码","预测价格","第一止盈","强势目标","失效位"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return None, "不是V20/V20.1预测CSV，缺少：" + "、".join(missing)
+
+    results = []
+    for _, row in df.iterrows():
+        base = row.to_dict()
+        base.update(grade_prediction_row(row))
+        results.append(base)
+    return pd.DataFrame(results), None
+
+
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V19.2")
+st.title("🎲 四时段强势回踩资金友好大师 V20.1")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -2232,6 +2688,16 @@ if "global_fetch_time" not in st.session_state:
     st.session_state.global_fetch_time = None
 if "global_mode" not in st.session_state:
     st.session_state.global_mode = None
+if "analysis_run_id" not in st.session_state:
+    st.session_state.analysis_run_id = None
+if "analysis_time" not in st.session_state:
+    st.session_state.analysis_time = None
+if "analysis_mode" not in st.session_state:
+    st.session_state.analysis_mode = None
+if "prediction_snapshots" not in st.session_state:
+    st.session_state.prediction_snapshots = {}
+if "prediction_saved_runs" not in st.session_state:
+    st.session_state.prediction_saved_runs = set()
 
 st.markdown("### 🕒 分析时段")
 mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘前大引不成", "收盘后预测明天"], horizontal=True)
@@ -2243,6 +2709,10 @@ st.caption("资金权重已提高到中等：质量接近时，100股占用资�
 
 
 if st.button("🧠 全自动分析", type="primary", use_container_width=True):
+    _now = datetime.now(JST)
+    st.session_state.analysis_time = _now.strftime("%Y-%m-%d %H:%M:%S JST")
+    st.session_state.analysis_run_id = f"{_now.strftime('%Y%m%dT%H%M%S')}_{mode}"
+    st.session_state.analysis_mode = mode
     with st.spinner("正在自动扫描行情、新闻、PTS、技术结构、历史回测和相似案例，并生成最终结论…"):
         # 1) Current market scan
         rank0, raw0, news0 = scan_all(STOCK_CODES, budget)
@@ -2279,7 +2749,7 @@ if st.button("🧠 全自动分析", type="primary", use_container_width=True):
         st.session_state.bt_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
 
 st.caption(
-    f"当前模式：{mode}。只要点一次『全自动分析』，网站会自动完成行情、新闻、PTS、海外/韩股/加密/宏观最新5分钟催化、技术面、回测、相似案例和风险过滤，最后直接给推荐。"
+    f"当前模式：{mode}。每次点击『全自动分析』都会生成并冻结本模式Top5：当时价格、回踩买入区间、止盈、失效位和关键指标都一起记录，方便之后按真实走势验算。"
 )
 
 rank = st.session_state.scan
@@ -2360,6 +2830,48 @@ if rank is not None and not rank.empty:
     st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
     st.caption(f"海外关联：{top.get('海外催化明细','未发现足够可靠且新鲜的海外关联信号')}")
 
+    # Freeze Top5 only for an explicit full-analysis click in this mode.
+    _run_id = st.session_state.analysis_run_id
+    _analysis_time = st.session_state.analysis_time
+    if _run_id and st.session_state.analysis_mode == mode:
+        if _run_id not in st.session_state.prediction_snapshots:
+            st.session_state.prediction_snapshots[_run_id] = build_top5_snapshot(
+                rank, mode, _run_id, _analysis_time
+            )
+        snap = st.session_state.prediction_snapshots[_run_id]
+
+        st.markdown("### 🏆 本模式 Top 5｜冻结预测")
+        st.caption(f"预测时间：{_analysis_time}｜{prediction_validation_rule(mode)}")
+        top5_cols = [
+            "排名","代码","日文名","中文名","预测价格","综合分","结论",
+            "买入计划类型","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标","风险"
+        ]
+        top5_view = snap[top5_cols].copy()
+        for c in ["预测价格","综合分","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标"]:
+            top5_view[c] = pd.to_numeric(top5_view[c], errors="coerce").round(2)
+        st.dataframe(top5_view, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "💾 下载这次Top5预测快照（明天可直接拿来验）",
+            data=snap.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"prediction_{_run_id}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        if supabase_configured():
+            if _run_id not in st.session_state.prediction_saved_runs:
+                _ok, _msg = save_predictions_supabase(snap)
+                if _ok:
+                    st.session_state.prediction_saved_runs.add(_run_id)
+                    st.success("☁️ 本次Top5已自动写入外部预测日志。")
+                else:
+                    st.warning(f"外部日志保存失败：{_msg}。CSV仍可正常保存。")
+            else:
+                st.caption("☁️ 本次Top5已保存到外部预测日志。")
+        else:
+            st.caption("☁️ 未接外部数据库也没关系：先下载CSV，明天收盘后把CSV给ChatGPT即可逐条验。")
+
     if st.session_state.bt_map:
         st.caption("下面是辅助细节；如果你只想要结论，看上面的最终结论和止盈计划即可。")
         st.markdown("#### 🧪 一键历史回测校准")
@@ -2401,7 +2913,11 @@ if rank is not None and not rank.empty:
             st.caption("今天没有股票通过『强势突破追强』风险门槛。宁可不追，也不把弱票突然暴拉当成主升突破。")
         else:
             breakout_pool = breakout_pool.sort_values(["追强分","综合分"], ascending=False).head(8)
-            bo_cols = ["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距20日高%","追强分","近10日冲高保留率%","冲高失败次数","弱势惩罚","PTS涨跌%","PTS可信度%","PTS调整分","追强理由","追强风险"]
+            breakout_pool["回踩计划"] = breakout_pool.apply(lambda rr: pullback_buy_plan(rr), axis=1)
+            breakout_pool["回踩买入下沿"] = breakout_pool["回踩计划"].apply(lambda x: x["回踩下沿"])
+            breakout_pool["回踩买入上沿"] = breakout_pool["回踩计划"].apply(lambda x: x["回踩上沿"])
+            breakout_pool["回踩失效位"] = breakout_pool["回踩计划"].apply(lambda x: x["失效位"])
+            bo_cols = ["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距20日高%","追强分","回踩买入下沿","回踩买入上沿","回踩失效位","近10日冲高保留率%","冲高失败次数","弱势惩罚","PTS涨跌%","PTS可信度%","PTS调整分","追强理由","追强风险"]
             bo_cols = [c for c in bo_cols if c in breakout_pool.columns]
             bo_df = breakout_pool.loc[:, bo_cols].copy()
             bo_num = [c for c in bo_cols if c not in ["代码","日文名","中文名","追强理由","追强风险"]]
@@ -2433,7 +2949,11 @@ if rank is not None and not rank.empty:
     if dip.empty:
         st.caption("今天没有满足‘强势 + 小回调 + 守支撑’的明显候选。")
     else:
-        st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","回调质量分","上方空间/支撑风险比","背景分","触发分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
+        dip["回踩计划"] = dip.apply(lambda rr: pullback_buy_plan(rr), axis=1)
+        dip["回踩买入下沿"] = dip["回踩计划"].apply(lambda x: x["回踩下沿"])
+        dip["回踩买入上沿"] = dip["回踩计划"].apply(lambda x: x["回踩上沿"])
+        dip["回踩失效位"] = dip["回踩计划"].apply(lambda x: x["失效位"])
+        st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","回踩买入下沿","回踩买入上沿","回踩失效位","回调质量分","上方空间/支撑风险比","背景分","触发分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### 排名表")
     show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","追强资格","追强分","追强理由","追强风险","历史状态","历史校准分","次日上涨概率%","3日延续概率%","3日假突破风险%","相似样本","自身样本","PTS价格","PTS涨跌%","PTS成交量","PTS成交额","PTS可信度%","PTS调整分","PTS状态","PTS时间","海外催化分","海外催化状态","海外有效因子数","海外最新数据时间","海外最新数据年龄分钟","海外催化明细","新闻判断","风险标签"]
@@ -2527,6 +3047,14 @@ if rank is not None and not rank.empty:
     p3.metric("制限值幅", f"±{format_num(row['制限值幅'],1)} 円")
     st.caption("涨跌停按东证通常制限值幅、以前一交易日基准价估算；连续无成交封板等情形可能触发次日扩大制限值幅，应以 JPX 当日公告为准。")
 
+    pb_single = pullback_buy_plan(row)
+    st.markdown("### 🪂 回踩买入计划（预测时固定）")
+    pb1,pb2,pb3 = st.columns(3)
+    pb1.metric("计划类型", pb_single["类型"])
+    pb2.metric("回踩买入区间", f"¥{pb_single['回踩下沿']:.0f} ～ ¥{pb_single['回踩上沿']:.0f}" if math.isfinite(pb_single["回踩下沿"]) else "—")
+    pb3.metric("失效参考", f"¥{pb_single['失效位']:.0f}" if math.isfinite(pb_single["失效位"]) else "—")
+    st.caption(pb_single["说明"])
+
     st.markdown("### 🎯 止盈计划（固定显示）")
     default_entry = float(row["现价"]) if math.isfinite(safe_float(row["现价"])) else 0.0
     entry_price = st.number_input("你的参考买入价 / 实际成本价", min_value=0.0, value=default_entry, step=1.0, key=f"entry_{selected}")
@@ -2552,6 +3080,84 @@ if rank is not None and not rank.empty:
         st.caption("暂未抓到公开新闻；不要把‘没抓到’理解成‘公司没有新闻’。")
 else:
     st.info("点击上面的“扫描 72 只股票”开始。首次加载可能稍慢。")
+
+with st.expander("📊 验证昨天/之前的预测 CSV", expanded=False):
+    st.markdown("""
+今天下载网站生成的 `prediction_....csv`。  
+到了验证日，把文件**直接拖到下面的框里**，然后点“开始判卷”。网站会自己抓实际行情，不用手填。
+""")
+    uploaded_pred = st.file_uploader(
+        "把之前下载的 prediction_....csv 拖到这里",
+        type=["csv"],
+        key="prediction_verify_upload",
+        accept_multiple_files=False,
+    )
+    if uploaded_pred is not None:
+        st.caption(f"已载入：{uploaded_pred.name}")
+        if st.button("📊 开始判卷", use_container_width=True, key="verify_prediction_btn"):
+            with st.spinner("正在抓实际行情并对照冻结预测…"):
+                verified_df, verify_err = verify_prediction_csv(uploaded_pred)
+            if verify_err:
+                st.error(verify_err)
+            elif verified_df is not None:
+                st.session_state["verified_prediction_df"] = verified_df
+
+    verified_df = st.session_state.get("verified_prediction_df")
+    if verified_df is not None and not verified_df.empty:
+        show_cols = [c for c in [
+            "排名","代码","日文名","中文名","模式","预测时间","预测价格",
+            "回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
+            "验证日期","实际开盘","实际最高","实际最低","实际收盘",
+            "最大浮盈%","最大浮亏%","收盘收益%","回踩买入区间触及",
+            "第一止盈命中","强势目标命中","失效位触及","低点后收盘反弹%","判卷结果"
+        ] if c in verified_df.columns]
+        view = verified_df[show_cols].copy()
+        for c in ["预测价格","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
+                  "实际开盘","实际最高","实际最低","实际收盘",
+                  "最大浮盈%","最大浮亏%","收盘收益%","低点后收盘反弹%"]:
+            if c in view.columns:
+                view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+        ok_count = verified_df["判卷结果"].astype(str).str.startswith("✅").sum() if "判卷结果" in verified_df.columns else 0
+        fail_count = verified_df["判卷结果"].astype(str).str.startswith("❌").sum() if "判卷结果" in verified_df.columns else 0
+        neutral_count = verified_df["判卷结果"].astype(str).str.startswith("🟡").sum() if "判卷结果" in verified_df.columns else 0
+        c1,c2,c3 = st.columns(3)
+        c1.metric("成功", int(ok_count))
+        c2.metric("一般/混乱", int(neutral_count))
+        c3.metric("失败", int(fail_count))
+
+        st.download_button(
+            "💾 下载判卷后的CSV",
+            data=verified_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="verified_predictions.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+with st.expander("☁️ 跨天预测日志 / Supabase连接"):
+    if supabase_configured():
+        st.success("已检测到Supabase配置。每次『全自动分析』的Top5会自动写入外部日志。")
+        recent = load_recent_predictions_supabase(100)
+        if recent.empty:
+            st.caption("暂时没有读到历史记录，或数据库表尚未创建。")
+        else:
+            cols = [c for c in ["analysis_time","mode","rank_no","code","jp_name","cn_name","price","score","plan_type","buy_zone_low","buy_zone_high","invalidation","tp1","tp2","verified_at","eval_close","close_return_pct"] if c in recent.columns]
+            st.dataframe(recent[cols], use_container_width=True, hide_index=True)
+    else:
+        st.markdown("""
+**不接数据库也能验证：** 每次分析下载Top5 CSV，第二天收盘后把CSV给ChatGPT。
+
+**要让网站自己跨天记住：**
+1. 创建一个 Supabase 免费项目。
+2. 在项目 SQL Editor 创建 `predictions` 表（完整SQL在 README）。
+3. Streamlit Cloud → App settings / Secrets 填：
+```toml
+SUPABASE_URL = "https://你的项目.supabase.co"
+SUPABASE_SECRET_KEY = "sb_secret_你的服务器密钥"
+```
+密钥只放 Streamlit Secrets，不要传到GitHub。
+""")
 
 with st.expander("股票池（72只）"):
     st.dataframe(pd.DataFrame(STOCKS, columns=["代码","日文正式/常用名","中文译名"]), use_container_width=True, hide_index=True)
