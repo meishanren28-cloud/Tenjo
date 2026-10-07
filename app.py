@@ -619,6 +619,36 @@ def gain_retention_quality(high: pd.Series, close: pd.Series):
     return float(np.clip(score, -15, 12)), avg * 100.0, failed
 
 
+
+
+def render_take_profit_banner(tp, is_recommended=True, note=None):
+    status = "推荐买点止盈计划" if is_recommended else "仅测算｜尚未触发A级买点"
+    border = "#16a34a" if is_recommended else "#d97706"
+    bg = "rgba(22,163,74,0.10)" if is_recommended else "rgba(217,119,6,0.10)"
+    extra = f"<div style='margin-top:8px;font-size:0.92rem;opacity:.82'>{note}</div>" if note else ""
+    st.markdown(f"""
+    <div style="border:3px solid {border};background:{bg};border-radius:16px;padding:18px 20px;margin:14px 0 18px 0;">
+      <div style="font-size:1.05rem;font-weight:800;margin-bottom:12px;">🎯 {status}</div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:190px;background:rgba(255,255,255,.72);border-radius:12px;padding:14px;">
+          <div style="font-size:.9rem;opacity:.75;">参考买入价</div>
+          <div style="font-size:1.55rem;font-weight:800;">¥{tp['参考买入价']:.0f}</div>
+        </div>
+        <div style="flex:1;min-width:190px;background:rgba(255,255,255,.72);border-radius:12px;padding:14px;">
+          <div style="font-size:.9rem;opacity:.75;">✅ 第一止盈</div>
+          <div style="font-size:1.9rem;font-weight:900;">¥{tp['第一止盈']:.0f}</div>
+          <div style="font-size:1rem;font-weight:700;">+{tp['第一止盈幅度%']:.1f}%</div>
+        </div>
+        <div style="flex:1;min-width:190px;background:rgba(255,255,255,.72);border-radius:12px;padding:14px;">
+          <div style="font-size:.9rem;opacity:.75;">🚀 强势续抱目标</div>
+          <div style="font-size:1.9rem;font-weight:900;">¥{tp['强势续抱目标']:.0f}</div>
+          <div style="font-size:1rem;font-weight:700;">+{tp['第二目标幅度%']:.1f}%</div>
+        </div>
+      </div>
+      {extra}
+    </div>
+    """, unsafe_allow_html=True)
+
 def take_profit_targets(row, entry_price=None):
     """Dynamic informational profit-taking references, not a guarantee or order instruction."""
     current = safe_float(row.get("现价", np.nan))
@@ -926,12 +956,10 @@ if rank is not None and not rank.empty:
                     f"距支撑 {format_num(best['距支撑%'])}%｜ATR {format_num(best['ATR14%'])}%｜一手约 ¥{best['一手资金']:,.0f}｜资金友好 {format_num(best['资金友好分'])}。"
                 )
                 st.write(f"风险：{best['风险标签']}。新闻：{best['新闻判断']}。")
-                if str(best["结论"]).startswith("A｜"):
-                    tp = take_profit_targets(best, best["现价"])
-                    st.write(f"**若按当前价约 ¥{tp['参考买入价']:.0f} 作为参考入场：第一止盈约 ¥{tp['第一止盈']:.0f}（{tp['第一止盈幅度%']:.1f}%），强势续抱目标约 ¥{tp['强势续抱目标']:.0f}（{tp['第二目标幅度%']:.1f}%）。**")
-                    st.caption(tp["说明"])
-                else:
-                    st.caption("当前还不是‘已触发’A级买点，因此不把止盈目标包装成买入指令；等重新转强后再按实际入场价计算。")
+                tp = take_profit_targets(best, best["现价"])
+                is_a = str(best["结论"]).startswith("A｜")
+                note = tp["说明"] if is_a else "当前还不是‘已触发’A级买点：以下止盈位只是按当前价做的预演，不代表现在就应该买。"
+                render_take_profit_banner(tp, is_recommended=is_a, note=note)
 
     st.divider()
     st.subheader("单票诊断")
@@ -951,15 +979,16 @@ if rank is not None and not rank.empty:
     p3.metric("制限值幅", f"±{format_num(row['制限值幅'],1)} 円")
     st.caption("涨跌停按东证通常制限值幅、以前一交易日基准价估算；连续无成交封板等情形可能触发次日扩大制限值幅，应以 JPX 当日公告为准。")
 
-    st.markdown("**🎯 动态止盈参考**")
+    st.markdown("### 🎯 止盈计划（固定显示）")
     default_entry = float(row["现价"]) if math.isfinite(safe_float(row["现价"])) else 0.0
     entry_price = st.number_input("你的参考买入价 / 实际成本价", min_value=0.0, value=default_entry, step=1.0, key=f"entry_{selected}")
     tp = take_profit_targets(row, entry_price if entry_price > 0 else row["现价"])
-    t1,t2,t3 = st.columns(3)
-    t1.metric("第一止盈", f"¥{tp['第一止盈']:.0f}", f"{tp['第一止盈幅度%']:.1f}%")
-    t2.metric("强势续抱目标", f"¥{tp['强势续抱目标']:.0f}", f"{tp['第二目标幅度%']:.1f}%")
-    t3.metric("冲高保留率", f"{format_num(row['近10日冲高保留率%'])}%", f"保留分 {format_num(row['涨幅保留分'])}")
-    st.caption(tp["说明"])
+    is_a = str(row["结论"]).startswith("A｜")
+    note = tp["说明"] if is_a else "当前不是A级已触发买点：下面止盈位固定显示给你做交易计划，但属于测算，不等于建议此刻买入。"
+    render_take_profit_banner(tp, is_recommended=is_a, note=note)
+    t1,t2 = st.columns(2)
+    t1.metric("📈 近10日冲高保留率", f"{format_num(row['近10日冲高保留率%'])}%")
+    t2.metric("⚠️ 冲高失败次数", f"{int(row['冲高失败次数']) if math.isfinite(safe_float(row['冲高失败次数'])) else '-'}")
     if row["冲高失败次数"] >= 3:
         st.warning("这只票近期多次出现‘盘中冲高、收盘吐回去’，即使触及止盈附近，也更适合分批兑现，不宜默认它一定继续冲。")
 
