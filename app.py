@@ -14,7 +14,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="强势回踩资金友好大师", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="三时段强势回踩大师", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -114,6 +114,12 @@ RULES = [
     "重视涨幅保留率：冲高后能把大部分涨幅留到收盘、连续几天收盘重心抬高，加分；反复冲高全吐、收盘越来越低，扣分。",
     "一旦给出可买/推荐，必须同时给动态止盈参考：结合买入价、ATR、近期前高/压力位和通常涨停价，而不是统一写死+5%。",
 ]
+
+MODE_DESCRIPTIONS = {
+    "开盘前": "用昨收/历史结构 + 隔夜新闻做盘前筛选。重点找今天值得盯的票，不把尚未发生的盘中转强当成既成事实。",
+    "盘中": "重点判断现在是否真的转强：实时价格、当日高低位置、量价、冲高回落与追高风险权重最高。",
+    "收盘后预测明天": "重点看收盘质量、全天涨幅保留、量能、关键位是否守住，以及新闻催化，用来挑明天优先观察/埋伏的票。",
+}
 
 POSITIVE_KW = [
     "上方修正","増益","増収","最高益","過去最高","上方修正","受注","大型受注","採用","提携","業務提携","資本提携",
@@ -228,6 +234,120 @@ def volatility_risk(high: pd.Series, low: pd.Series, close: pd.Series):
         elif atr_pct >= 7: penalty = 10
         elif atr_pct >= 5: penalty = 5
     return penalty, atr_pct
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def download_intraday(codes_tuple):
+    symbols = [ticker(c) for c in codes_tuple]
+    try:
+        return yf.download(
+            tickers=symbols,
+            period="1d",
+            interval="5m",
+            auto_adjust=False,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def extract_intraday(data, code):
+    if data is None or getattr(data, "empty", True):
+        return None
+    sym = ticker(code)
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            if sym in data.columns.get_level_values(0):
+                d = data[sym].copy()
+            elif sym in data.columns.get_level_values(-1):
+                d = data.xs(sym, axis=1, level=-1).copy()
+            else:
+                return None
+        else:
+            d = data.copy()
+        d = d.dropna(how="all")
+        return d if not d.empty else None
+    except Exception:
+        return None
+
+
+def apply_intraday_features(rank, intraday_batch):
+    rank = rank.copy()
+    for col, default in [("盘中现价", np.nan),("盘中涨跌%", np.nan),("当日位置%", np.nan),("距日高%", np.nan),("盘中量价分",0.0)]:
+        rank[col] = default
+    for idx, row in rank.iterrows():
+        code = str(row["代码"])
+        d = extract_intraday(intraday_batch, code)
+        if d is None or len(d) < 2 or "Close" not in d.columns:
+            continue
+        c = safe_float(d["Close"].dropna().iloc[-1])
+        hi = safe_float(d["High"].max()) if "High" in d.columns else c
+        lo = safe_float(d["Low"].min()) if "Low" in d.columns else c
+        prev = safe_float(row.get("现价", np.nan))
+        # daily row may already include today's partial bar; prefer prior close reconstructed from 日涨跌 when possible
+        daypct = safe_float(row.get("日涨跌%", np.nan))
+        if math.isfinite(daypct) and math.isfinite(prev) and abs(daypct) < 50:
+            base = prev / (1 + daypct/100.0) if (1 + daypct/100.0) != 0 else np.nan
+        else:
+            base = np.nan
+        if not math.isfinite(base):
+            base = safe_float(d["Open"].dropna().iloc[0])
+        dp = pct(c, base)
+        pos = (c-lo)/(hi-lo)*100 if math.isfinite(hi) and math.isfinite(lo) and hi>lo else np.nan
+        from_hi = pct(c, hi)
+        score = 0.0
+        if math.isfinite(dp):
+            if 0.5 <= dp <= 4: score += 8
+            elif dp > 7: score -= 7
+            elif dp < -4: score -= 9
+        if math.isfinite(pos):
+            if pos >= 75: score += 7
+            elif pos <= 25: score -= 7
+        if math.isfinite(from_hi) and from_hi < -3: score -= 4
+        rank.at[idx,"盘中现价"] = c
+        rank.at[idx,"盘中涨跌%"] = dp
+        rank.at[idx,"当日位置%"] = pos
+        rank.at[idx,"距日高%"] = from_hi
+        rank.at[idx,"盘中量价分"] = float(np.clip(score,-20,20))
+    return rank
+
+
+def mode_score(rank: pd.DataFrame, mode: str, budget: int):
+    r = rank.copy()
+    aff = r["现价"].apply(lambda x: affordability_score(x, budget))
+    r["资金友好分"] = [x[0] for x in aff]
+    r["一手资金"] = [x[1] for x in aff]
+    r["预算可买一手"] = [x[2] for x in aff]
+    news = r.get("新闻分", pd.Series(0.0, index=r.index)).astype(float)
+    bg = r["背景分"].astype(float)
+    trig = r["触发分"].astype(float)
+    risk = r["风险总惩罚"].astype(float)
+    pull = r["安全回调分"].astype(float)
+    retain = r["涨幅保留分"].astype(float)
+    cheap = r["资金友好分"].astype(float)
+
+    if mode == "开盘前":
+        # Yesterday's structure + news + affordable execution. Trigger is only a minor prior-session clue.
+        score = 0.58*bg + 0.22*np.maximum(pull,0) + 0.18*trig + 0.75*news - 0.72*risk
+        r["模式说明"] = "盘前：重背景/支撑/隔夜新闻，少依赖尚未发生的盘中触发"
+    elif mode == "盘中":
+        intra = r.get("盘中量价分", pd.Series(0.0,index=r.index)).astype(float)
+        score = 0.38*bg + 0.72*trig + 0.32*np.maximum(pull,0) + 1.0*intra + 0.45*news - 0.82*risk
+        r["模式说明"] = "盘中：重实时转强/日内位置/量价，严惩追高和冲高回落"
+    else:
+        # Closing quality / retention matters most for next-day watchlist.
+        score = 0.48*bg + 0.42*trig + 0.38*np.maximum(pull,0) + 0.85*retain + 0.58*news - 0.76*risk
+        r["模式说明"] = "收盘后：重收盘质量/涨幅留存/全天量价，筛明日候选"
+
+    # Cheapness is a tie-breaker only for healthy candidates, never a rescue factor.
+    healthy = r["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
+    score = pd.Series(score, index=r.index)
+    score.loc[healthy] += cheap.loc[healthy]
+    r["模式分"] = score.clip(-50,100)
+    r = r.sort_values(["模式分","背景分","触发分","一手资金"], ascending=[False,False,False,True]).reset_index(drop=True)
+    return r
 
 
 def ticker(code: str) -> str:
@@ -678,8 +798,8 @@ def chart_for(code, raw_df, support=None):
 
 
 # ---------- UI ----------
-st.title("🎲 强势回踩资金友好大师")
-st.caption("结构评分 + 买点触发 + 资金效率 + 点兵 · 股票池固定 72 只 · 免费行情源 Yahoo Finance/yfinance（可能延迟）")
+st.title("🎲 三时段强势回踩资金友好大师")
+st.caption("开盘前 / 盘中 / 收盘后预测明天 · 三套侧重不同的评分 · 股票池固定 72 只 · 免费行情可能延迟")
 
 with st.expander("先看核心纪律（网站会强制执行）", expanded=True):
     for x in RULES:
@@ -703,6 +823,10 @@ if "raw" not in st.session_state:
 if "news" not in st.session_state:
     st.session_state.news = None
 
+st.markdown("### 🕒 分析时段")
+mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘后预测明天"], horizontal=True)
+st.info(MODE_DESCRIPTIONS[mode])
+
 st.markdown("### 💴 资金偏好")
 budget = st.slider("单只股票最多愿意占用多少一手资金？", 100000, 1000000, 300000, 50000, format="¥%d")
 st.caption("这里只影响合格候选之间的排序。便宜不会救活弱票；真正抓行情仍按股票代码进行。")
@@ -712,11 +836,15 @@ with left:
     if st.button("🚀 扫描 72 只股票", type="primary", use_container_width=True):
         with st.spinner("正在拉取行情、计算趋势，并对前排候选精查新闻…"):
             rank, raw, news = scan_all(STOCK_CODES)
+            if mode == "盘中":
+                intra = download_intraday(tuple(STOCK_CODES))
+                rank = apply_intraday_features(rank, intra)
             st.session_state.scan = rank
             st.session_state.raw = raw
             st.session_state.news = news
+            st.session_state.scan_mode = mode
 with right:
-    st.caption("扫描逻辑：先看趋势和价位 → 剔除连续创新低/放量不涨 → 判断回踩是否守住 → 判断是否重新转强 → 最后给前排候选叠加近期新闻催化。")
+    st.caption(f"当前模式：{mode}。先过弱势/破位硬门槛，再按该时段的权重排序；便宜只在合格候选之间加分。")
 
 rank = st.session_state.scan
 raw_map = st.session_state.raw or {}
@@ -724,24 +852,22 @@ news_map = st.session_state.news or {}
 
 if rank is not None and not rank.empty:
     rank = rank.copy()
-    aff = rank["现价"].apply(lambda x: affordability_score(x, budget))
-    rank["资金友好分"] = [x[0] for x in aff]
-    rank["一手资金"] = [x[1] for x in aff]
-    rank["预算可买一手"] = [x[2] for x in aff]
-    # Rebuild final score from technical + news + affordability only for healthy candidates.
-    rank["综合分"] = (rank["技术总分"] + rank["新闻分"]).clip(-50,100)
-    good_mask = rank["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
-    rank.loc[good_mask, "综合分"] = (rank.loc[good_mask, "综合分"] + rank.loc[good_mask, "资金友好分"]).clip(-50,100)
-    rank = rank.sort_values(["综合分","背景分","触发分","一手资金"], ascending=[False,False,False,True]).reset_index(drop=True)
-    st.subheader("今天优先看谁")
+    # If user changed mode after scanning, reuse daily scan and fetch intraday only when needed.
+    if mode == "盘中" and "盘中量价分" not in rank.columns:
+        intra = download_intraday(tuple(STOCK_CODES))
+        rank = apply_intraday_features(rank, intra)
+    rank = mode_score(rank, mode, budget)
+    rank["综合分"] = rank["模式分"]  # backward-compatible display name
+    heading = {"开盘前":"今天开盘前优先盯谁", "盘中":"盘中现在优先看谁", "收盘后预测明天":"明天优先观察谁"}[mode]
+    st.subheader(heading)
     top = rank.iloc[0]
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("第一名", stock_label(str(top["代码"])))
-    c2.metric("综合分", format_num(top["综合分"],1))
+    c2.metric(f"{mode}分", format_num(top["综合分"],1))
     c3.metric("背景 / 触发", f"{format_num(top['背景分'],0)} / {format_num(top['触发分'],0)}")
     c4.metric("一手资金", f"¥{top['一手资金']:,.0f}" if math.isfinite(top['一手资金']) else "—")
     c5.metric("结论", top["结论"])
-    st.info(f"第一名 {stock_label(str(top['代码']))}：{top['风险标签']}；{top['新闻判断']}。注意：第一名也必须等实际盘口确认，不等于无脑买。")
+    st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
 
     # Fun layer: rules first, randomness second. Weak/broken names are never admitted to the draw.
     st.markdown("#### 🎲 大师点兵：先过纪律，再交给一点运气")
@@ -772,6 +898,10 @@ if rank is not None and not rank.empty:
 
     st.markdown("#### 排名表")
     show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","新闻判断","风险标签"]
+    if mode == "盘中":
+        for extra in ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]:
+            if extra in rank.columns:
+                show_cols.insert(6, extra)
     display_df = rank[show_cols].copy()
     num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","新闻判断","风险标签"]]
     display_df[num_cols] = display_df[num_cols].round(2)
@@ -851,6 +981,15 @@ else:
 
 with st.expander("股票池（72只）"):
     st.dataframe(pd.DataFrame(STOCKS, columns=["代码","日文正式/常用名","中文译名"]), use_container_width=True, hide_index=True)
+
+with st.expander("三个时段为什么分开算"):
+    st.markdown("""
+- **开盘前**：重昨收结构、趋势背景、回踩位置和隔夜新闻；触发分只作参考，因为今天还没真正走出来。  
+- **盘中**：重实时重新转强、当日位置、距日高、冲高回落和追高风险；这是最严格的“现在能不能买”。  
+- **收盘后预测明天**：重收盘质量、涨幅保留、全天量价和关键位是否守住；用于做第二天观察清单。  
+
+同一只票在三个模式得分不同是正常的。**资金友好度始终只作为合格候选之间的加分项，不会救活弱票。**
+""")
 
 with st.expander("评分怎么判"):
     st.markdown("""
