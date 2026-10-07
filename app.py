@@ -884,6 +884,23 @@ def score_news(items):
     return score, label
 
 
+def force_news_check(code: str):
+    """Always perform a news lookup for an explicitly inspected/recommended stock.
+    Returns (score, display_label, items). Never returns an "unreviewed" placeholder.
+    """
+    items = fetch_news(code)
+    if not items:
+        return 0.0, "新闻获取失败或未找到近期匹配新闻", []
+    ns, label = score_news(items)
+    if label.startswith("有潜在正面催化词"):
+        display = "已检索｜潜在正面催化｜" + label.split("：", 1)[-1]
+    elif label.startswith("存在风险新闻词"):
+        display = "已检索｜风险新闻｜" + label.split("：", 1)[-1]
+    else:
+        display = "已检索｜无明显催化/风险关键词"
+    return float(ns), display, items
+
+
 def classify(row):
     risk = row["风险标签"]
     if "刷新20日低点" in risk or (math.isfinite(row["20日%"] ) and row["20日%"] < -12):
@@ -933,7 +950,7 @@ def scan_all(codes):
         return pd.DataFrame(), {}, {}
     base = pd.DataFrame(rows)
     base["新闻分"] = 0.0
-    base["新闻判断"] = "未精查"
+    base["新闻判断"] = "—"
     # Capital friendliness is a tie-breaker only. It is added later only for non-weak candidates.
     aff = base["现价"].apply(lambda x: affordability_score(x, 300000))
     base["资金友好分"] = [x[0] for x in aff]
@@ -973,7 +990,7 @@ def chart_for(code, raw_df, support=None):
 
 
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师")
+st.title("🎲 四时段强势回踩资金友好大师 V11")
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 免费行情可能延迟")
 
 with st.expander("先看核心纪律（网站会强制执行）", expanded=True):
@@ -1035,7 +1052,10 @@ if rank is not None and not rank.empty:
     rank["综合分"] = rank["模式分"]  # backward-compatible display name
     heading = {"开盘前":"今天开盘前优先盯谁", "盘中":"盘中现在优先看谁", "收盘前大引不成":"收盘前大引不成优先候选", "收盘后预测明天":"明天优先观察谁"}[mode]
     st.subheader(heading)
-    top = rank.iloc[0]
+    top = rank.iloc[0].copy()
+    top_ns, top_news_label, top_news_items = force_news_check(str(top["代码"]))
+    top["新闻分"] = top_ns
+    top["新闻判断"] = top_news_label
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("第一名", stock_label(str(top["代码"])))
     c2.metric(f"{mode}分", format_num(top["综合分"],1))
@@ -1110,7 +1130,10 @@ if rank is not None and not rank.empty:
         if scope.empty:
             st.error("没识别到股票池里的代码。直接输入代码最稳，例如：6203 和 5801 哪个更好？")
         else:
-            best = scope.sort_values("综合分", ascending=False).iloc[0]
+            best = scope.sort_values("综合分", ascending=False).iloc[0].copy()
+            q_ns, q_news_label, q_items = force_news_check(str(best["代码"]))
+            best["新闻分"] = q_ns
+            best["新闻判断"] = q_news_label
             if "追" in q and math.isfinite(best["日涨跌%"] or np.nan) and best["日涨跌%"] >= 6:
                 st.error(f"{best['代码']} 今天已经明显拉升。按你的纪律：**不追突然暴拉**。等回踩守住关键位、再度转强再看。")
             else:
@@ -1128,7 +1151,15 @@ if rank is not None and not rank.empty:
     st.divider()
     st.subheader("单票诊断")
     selected = st.selectbox("股票", rank["代码"].tolist(), format_func=stock_label)
-    row = rank[rank["代码"] == selected].iloc[0]
+    row = rank[rank["代码"] == selected].iloc[0].copy()
+    single_ns, single_news_label, single_news_items = force_news_check(str(selected))
+    row["新闻分"] = single_ns
+    row["新闻判断"] = single_news_label
+    # Keep this explicit check in session so the news list and label come from the same lookup.
+    if st.session_state.news is None:
+        st.session_state.news = {}
+    st.session_state.news[str(selected)] = (single_ns, single_news_label, single_news_items)
+    news_map = st.session_state.news
     m1,m2,m3,m4,m5,m6 = st.columns(6)
     m1.metric("现价", format_num(row["现价"],1))
     m2.metric("一手资金", f"¥{row['一手资金']:,.0f}")
@@ -1160,10 +1191,7 @@ if rank is not None and not rank.empty:
 
     if selected in raw_map:
         st.plotly_chart(chart_for(selected, raw_map[selected], row["关键支撑"]), use_container_width=True)
-    if selected in news_map:
-        items = news_map[selected][2]
-    else:
-        items = fetch_news(selected)
+    items = single_news_items
     if items:
         st.markdown("**近期公开新闻**")
         for it in items[:6]:
