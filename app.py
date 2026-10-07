@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V17.1", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V19", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -1765,8 +1765,417 @@ def apply_pts_features(rank: pd.DataFrame, pts_map: dict, mode: str):
     return r
 
 
+
+# ---------- Overseas / cross-market catalyst layer ----------
+# The factor set is intentionally broad. The program does NOT assume every Japanese stock
+# cares about every factor. It estimates each stock's own recent lead relationship and only
+# uses factors with enough samples and non-trivial correlation.
+GLOBAL_FACTORS = {
+    "SOX": {"symbol":"^SOX", "kind":"US", "label":"PHLX半导体", "tz":"America/New_York"},
+    "Nasdaq100": {"symbol":"QQQ", "kind":"US", "label":"Nasdaq100", "tz":"America/New_York"},
+    "SMH": {"symbol":"SMH", "kind":"US", "label":"美股半导体ETF", "tz":"America/New_York"},
+    "NVDA": {"symbol":"NVDA", "kind":"US", "label":"NVIDIA", "tz":"America/New_York"},
+    "Micron": {"symbol":"MU", "kind":"US", "label":"Micron", "tz":"America/New_York"},
+    "SK hynix": {"symbol":"000660.KS", "kind":"KR", "label":"SK hynix", "tz":"Asia/Seoul"},
+    "Samsung": {"symbol":"005930.KS", "kind":"KR", "label":"Samsung电子", "tz":"Asia/Seoul"},
+    "BTC": {"symbol":"BTC-USD", "kind":"24H", "label":"Bitcoin", "tz":"UTC"},
+    "Copper": {"symbol":"HG=F", "kind":"EXTENDED", "label":"铜", "tz":"America/New_York"},
+    "Gold": {"symbol":"GC=F", "kind":"EXTENDED", "label":"黄金", "tz":"America/New_York"},
+    "Oil": {"symbol":"CL=F", "kind":"EXTENDED", "label":"WTI原油", "tz":"America/New_York"},
+    "USDJPY": {"symbol":"JPY=X", "kind":"EXTENDED", "label":"美元/日元", "tz":"UTC"},
+    "US10Y": {"symbol":"^TNX", "kind":"US", "label":"美国10年期收益率", "tz":"America/New_York"},
+    "US Financials": {"symbol":"XLF", "kind":"US", "label":"美股金融", "tz":"America/New_York"},
+    "US Defense": {"symbol":"ITA", "kind":"US", "label":"美股军工", "tz":"America/New_York"},
+}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def download_global_factors():
+    symbols = [v["symbol"] for v in GLOBAL_FACTORS.values()]
+    try:
+        return yf.download(
+            tickers=symbols,
+            period="8mo",
+            interval="1d",
+            auto_adjust=True,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+            timeout=25,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=90, show_spinner=False)
+def download_global_factors_intraday():
+    """Latest free overseas factor data.
+    5-minute bars, including US pre/post market when Yahoo provides them.
+    Cache is intentionally short so repeated full analyses stay reasonably fresh.
+    """
+    symbols = [v["symbol"] for v in GLOBAL_FACTORS.values()]
+    try:
+        return yf.download(
+            tickers=symbols,
+            period="5d",
+            interval="5m",
+            prepost=True,
+            auto_adjust=True,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+            timeout=25,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+def _extract_factor_df(batch, symbol):
+    try:
+        if batch is None or batch.empty:
+            return pd.DataFrame()
+        if isinstance(batch.columns, pd.MultiIndex):
+            if symbol not in batch.columns.get_level_values(0):
+                return pd.DataFrame()
+            d = batch[symbol].copy()
+        else:
+            d = batch.copy()
+        if "Close" not in d.columns:
+            return pd.DataFrame()
+        d = d.dropna(subset=["Close"]).copy()
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+def _factor_return_series(batch, factor_name):
+    meta = GLOBAL_FACTORS[factor_name]
+    d = _extract_factor_df(batch, meta["symbol"])
+    if d.empty:
+        return pd.DataFrame()
+    x = pd.DataFrame(index=pd.to_datetime(d.index).tz_localize(None))
+    x["factor_ret"] = d["Close"].astype(float).pct_change() * 100
+    x = x.dropna()
+    return x
+
+def _lead_pair(stock_df, factor_ret_df):
+    """Map each Japan trading day to the most recent *prior* overseas factor session.
+    This avoids accidentally using same-day future information in historical correlation.
+    """
+    if stock_df is None or stock_df.empty or factor_ret_df is None or factor_ret_df.empty:
+        return pd.DataFrame()
+    s = stock_df.dropna(subset=["Close"]).copy()
+    if len(s) < 35:
+        return pd.DataFrame()
+    sidx = pd.to_datetime(s.index).tz_localize(None)
+    sr = pd.DataFrame({
+        "date": sidx,
+        "stock_ret": s["Close"].astype(float).pct_change().values * 100
+    }).dropna().sort_values("date")
+    fr = factor_ret_df.reset_index().rename(columns={factor_ret_df.index.name or "index":"fdate"})
+    if "fdate" not in fr.columns:
+        fr = fr.rename(columns={fr.columns[0]:"fdate"})
+    fr["fdate"] = pd.to_datetime(fr["fdate"]).dt.tz_localize(None)
+    fr = fr.sort_values("fdate")
+    paired = pd.merge_asof(
+        sr,
+        fr,
+        left_on="date",
+        right_on="fdate",
+        direction="backward",
+        allow_exact_matches=False,
+    )
+    paired = paired.dropna(subset=["stock_ret","factor_ret"])
+    return paired.tail(100)
+
+def _winsor(s, q=0.03):
+    if s is None or len(s) < 8:
+        return s
+    lo, hi = s.quantile(q), s.quantile(1-q)
+    return s.clip(lo, hi)
+
+def _factor_relation(stock_df, factor_ret_df):
+    paired = _lead_pair(stock_df, factor_ret_df)
+    if paired.empty or len(paired) < 35:
+        return None
+    x = _winsor(paired["factor_ret"].astype(float))
+    y = _winsor(paired["stock_ret"].astype(float))
+    corr = x.corr(y, method="spearman")
+    if corr is None or not math.isfinite(float(corr)):
+        return None
+    n = len(paired)
+    # Reliability requires both enough history and a relationship meaningfully above noise.
+    abs_c = abs(float(corr))
+    rel = min(1.0, n / 70.0) * max(0.0, min(1.0, (abs_c - 0.15) / 0.35))
+    return {"corr":float(corr), "n":int(n), "reliability":float(rel)}
+
+
+def _to_utc_timestamp(ts, tz_name="UTC"):
+    try:
+        x = pd.Timestamp(ts)
+        if x.tzinfo is None:
+            x = x.tz_localize(tz_name)
+        return x.tz_convert("UTC")
+    except Exception:
+        return None
+
+def _previous_daily_close(daily_df, latest_utc, tz_name):
+    if daily_df is None or daily_df.empty or latest_utc is None:
+        return np.nan
+    c = daily_df["Close"].astype(float).dropna()
+    if c.empty:
+        return np.nan
+    try:
+        local_date = latest_utc.tz_convert(tz_name).date()
+    except Exception:
+        local_date = latest_utc.date()
+
+    dated = []
+    for idx, val in c.items():
+        try:
+            d = pd.Timestamp(idx)
+            if d.tzinfo is not None:
+                d = d.tz_convert(tz_name).tz_localize(None)
+            dated.append((d.date(), float(val)))
+        except Exception:
+            continue
+    prior = [v for d,v in dated if d < local_date]
+    if prior:
+        return prior[-1]
+    # Last-resort fallback: second-last daily bar is safer than today's partial daily bar.
+    if len(c) >= 2:
+        return float(c.iloc[-2])
+    return float(c.iloc[-1])
+
+def _latest_factor_snapshot(daily_batch, intraday_batch, factor_name):
+    """Latest available 5-minute factor snapshot.
+    Returns None instead of pretending stale/missing data is current.
+    """
+    meta = GLOBAL_FACTORS[factor_name]
+    intr = _extract_factor_df(intraday_batch, meta["symbol"])
+    daily = _extract_factor_df(daily_batch, meta["symbol"])
+    if intr.empty or "Close" not in intr.columns:
+        return None
+
+    c5 = intr["Close"].astype(float).dropna()
+    if c5.empty:
+        return None
+
+    latest_price = float(c5.iloc[-1])
+    latest_utc = _to_utc_timestamp(c5.index[-1], meta.get("tz","UTC"))
+    if latest_utc is None:
+        return None
+
+    now_utc = pd.Timestamp.now(tz="UTC")
+    age_min = max(0.0, float((now_utc - latest_utc).total_seconds() / 60.0))
+
+    ref = _previous_daily_close(daily, latest_utc, meta.get("tz","UTC"))
+    if not math.isfinite(ref) or ref <= 0:
+        return None
+
+    ret = (latest_price / ref - 1) * 100
+
+    dc = daily["Close"].astype(float).dropna() if not daily.empty and "Close" in daily.columns else pd.Series(dtype=float)
+    hist_ret = dc.pct_change().dropna() * 100
+    vol = float(hist_ret.tail(60).std()) if len(hist_ret) >= 15 else (float(hist_ret.std()) if len(hist_ret) >= 5 else np.nan)
+    if math.isfinite(vol) and vol > 1e-9:
+        z = float(np.clip(ret / vol, -3.5, 3.5))
+    else:
+        z = float(np.clip(ret / 2.0, -3.5, 3.5))
+
+    try:
+        local_ts = latest_utc.tz_convert(meta.get("tz","UTC"))
+        time_text = local_ts.strftime("%m/%d %H:%M")
+    except Exception:
+        time_text = latest_utc.strftime("%m/%d %H:%M UTC")
+
+    return {
+        "ret":float(ret),
+        "z":z,
+        "date":latest_utc,
+        "age_min":age_min,
+        "kind":meta["kind"],
+        "label":meta["label"],
+        "time_text":time_text,
+        "latest_price":latest_price,
+        "interval":"5m",
+    }
+
+def _latest_jp_date(raw_map):
+    dates = []
+    for d in (raw_map or {}).values():
+        if d is not None and not d.empty:
+            try:
+                idx = pd.to_datetime(d.index[-1])
+                if getattr(idx, "tzinfo", None) is not None:
+                    idx = idx.tz_localize(None)
+                dates.append(idx.normalize())
+            except Exception:
+                pass
+    return max(dates) if dates else None
+
+def _age_freshness(age_min, kind, mode):
+    """Freshness from actual bar age, not merely date labels."""
+    if not math.isfinite(safe_float(age_min)):
+        return 0.0
+    a = float(age_min)
+
+    if kind in ["24H", "EXTENDED"]:
+        if a <= 15: return 1.0
+        if a <= 45: return 0.90
+        if a <= 120: return 0.70
+        if a <= 360: return 0.45
+        if a <= 720: return 0.20
+        return 0.0
+
+    if kind == "KR":
+        if mode in ["盘中", "收盘前大引不成"]:
+            if a <= 15: return 0.85
+            if a <= 45: return 0.70
+            if a <= 120: return 0.40
+            return 0.0
+        # Korea is mostly peer breadth for next-session analysis.
+        if a <= 180: return 0.40
+        if a <= 720: return 0.22
+        return 0.0
+
+    if kind == "US":
+        if mode in ["开盘前", "收盘后预测明天"]:
+            # Fresh US regular/pre/post data can be several hours old by Japan morning
+            # and still be the newest information for the next TSE open.
+            if a <= 30: return 1.0
+            if a <= 120: return 0.95
+            if a <= 360: return 0.90
+            if a <= 720: return 0.75
+            if a <= 1080: return 0.45
+            return 0.0
+        # During Japan trading, last night's US move is mostly already in the opening price.
+        if a <= 180: return 0.25
+        return 0.0
+
+    return 0.0
+
+def _global_freshness(snapshot, last_jp_date, mode):
+    if snapshot is None:
+        return 0.0
+    return _age_freshness(snapshot.get("age_min", np.nan), snapshot.get("kind"), mode)
+
+def compute_global_catalysts(raw_map, mode):
+    """Estimate stock-specific overseas catalyst scores.
+    The stock itself chooses its relevant factors via recent historical lead correlation.
+    """
+    batch = download_global_factors()
+    intraday_batch = download_global_factors_intraday()
+    if batch is None or batch.empty:
+        return {}
+
+    factor_returns = {}
+    snapshots = {}
+    for name in GLOBAL_FACTORS:
+        factor_returns[name] = _factor_return_series(batch, name)
+        snapshots[name] = _latest_factor_snapshot(batch, intraday_batch, name)
+
+    last_jp_date = _latest_jp_date(raw_map)
+    out = {}
+
+    for code, stock_df in (raw_map or {}).items():
+        candidates = []
+        for name in GLOBAL_FACTORS:
+            rel = _factor_relation(stock_df, factor_returns[name])
+            snap = snapshots[name]
+            if rel is None or snap is None:
+                continue
+
+            fresh = _global_freshness(snap, last_jp_date, mode)
+            if fresh <= 0:
+                continue
+
+            # Dynamic contribution:
+            # signed lead correlation × current standardized factor move × reliability × freshness.
+            raw_contrib = rel["corr"] * snap["z"] * rel["reliability"] * fresh * 3.2
+            contrib = float(np.clip(raw_contrib, -3.0, 3.0))
+
+            # Ignore trivial signals; they add clutter but no information.
+            if abs(contrib) < 0.18:
+                continue
+
+            candidates.append({
+                "name":name,
+                "label":snap["label"],
+                "corr":rel["corr"],
+                "n":rel["n"],
+                "reliability":rel["reliability"],
+                "factor_ret":snap["ret"],
+                "z":snap["z"],
+                "freshness":fresh,
+                "age_min":snap.get("age_min", np.nan),
+                "time_text":snap.get("time_text","—"),
+                "contrib":contrib,
+            })
+
+        # Keep only the strongest distinct signals, positive or negative.
+        candidates = sorted(candidates, key=lambda x: abs(x["contrib"]), reverse=True)[:3]
+        total = float(np.clip(sum(x["contrib"] for x in candidates), -8.0, 8.0))
+        if candidates:
+            detail = "；".join(
+                f"{x['label']} {x['factor_ret']:+.2f}% / 相关{x['corr']:+.2f} / {x['contrib']:+.1f}分 / 更新{x['time_text']}({x['age_min']:.0f}分钟前)"
+                for x in candidates
+            )
+            if total >= 2:
+                status = "🟢 海外催化偏正面"
+            elif total <= -2:
+                status = "🔴 海外催化偏负面"
+            else:
+                status = "⚪ 海外催化中性"
+        else:
+            detail = "未发现足够可靠且新鲜的海外关联信号"
+            status = "⚪ 海外催化中性"
+
+        newest = min([safe_float(x.get("age_min")) for x in candidates if math.isfinite(safe_float(x.get("age_min")))], default=np.nan)
+        latest_time = candidates[0].get("time_text","—") if candidates else "—"
+        out[str(code)] = {
+            "海外催化分":total,
+            "海外催化状态":status,
+            "海外催化明细":detail,
+            "海外有效因子数":len(candidates),
+            "海外最新数据时间":latest_time,
+            "海外最新数据年龄分钟":newest,
+        }
+    return out
+
+def apply_global_catalysts(rank: pd.DataFrame, catalyst_map: dict, mode: str):
+    r = rank.copy()
+    for c, default in [
+        ("海外催化分",0.0),
+        ("海外催化状态","⚪ 海外催化中性"),
+        ("海外催化明细","未运行"),
+        ("海外有效因子数",0),
+        ("海外最新数据时间","—"),
+        ("海外最新数据年龄分钟",np.nan),
+    ]:
+        r[c] = default
+
+    for idx, row in r.iterrows():
+        d = (catalyst_map or {}).get(str(row["代码"]))
+        if not d:
+            continue
+        for k,v in d.items():
+            r.at[idx,k] = v
+
+    # Overseas data can matter in all four modes, but it matters most before the next session.
+    # During Japan trading, already-known US overnight moves are heavily freshness-discounted,
+    # while live Korea / FX / crypto / futures can still contribute modestly.
+    if mode in ["开盘前", "收盘后预测明天"]:
+        adj = r["海外催化分"].astype(float).clip(-8,8)
+    else:
+        adj = r["海外催化分"].astype(float).clip(-4,4)
+    r["模式分"] = (r["模式分"].astype(float) + adj).clip(-50,100)
+    r["综合分"] = r["模式分"]
+    r = r.sort_values(
+        ["模式分","回调质量分","背景分","触发分","一手资金"],
+        ascending=[False,False,False,False,True]
+    ).reset_index(drop=True)
+    return r
+
+
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V17.1")
+st.title("🎲 四时段强势回踩资金友好大师 V19")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -1801,6 +2210,12 @@ if "pts_map" not in st.session_state:
     st.session_state.pts_map = None
 if "pts_fetch_time" not in st.session_state:
     st.session_state.pts_fetch_time = None
+if "global_catalysts" not in st.session_state:
+    st.session_state.global_catalysts = None
+if "global_fetch_time" not in st.session_state:
+    st.session_state.global_fetch_time = None
+if "global_mode" not in st.session_state:
+    st.session_state.global_mode = None
 
 st.markdown("### 🕒 分析时段")
 mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘前大引不成", "收盘后预测明天"], horizontal=True)
@@ -1834,14 +2249,21 @@ if st.button("🧠 全自动分析", type="primary", use_container_width=True):
             st.session_state.pts_map = None
             st.session_state.pts_fetch_time = None
 
-        # 4) One-click historical backtest + similarity calibration
+        # 4) Overseas / Korean / crypto / macro catalyst layer.
+        # The model first checks each stock's own historical relationship, then only uses
+        # factors that are both relevant and fresh for the next Japanese session.
+        st.session_state.global_catalysts = compute_global_catalysts(raw0 or {}, mode)
+        st.session_state.global_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+        st.session_state.global_mode = mode
+
+        # 5) One-click historical backtest + similarity calibration
         bt_map, bt_n = run_one_click_backtest(raw0 or {})
         st.session_state.bt_map = bt_map
         st.session_state.bt_case_count = bt_n
         st.session_state.bt_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
 
 st.caption(
-    f"当前模式：{mode}。只要点一次『全自动分析』，网站会自动完成行情、新闻、PTS、技术面、回测、相似案例和风险过滤，最后直接给推荐。"
+    f"当前模式：{mode}。只要点一次『全自动分析』，网站会自动完成行情、新闻、PTS、海外/韩股/加密/宏观最新5分钟催化、技术面、回测、相似案例和风险过滤，最后直接给推荐。"
 )
 
 rank = st.session_state.scan
@@ -1854,6 +2276,9 @@ if rank is not None and not rank.empty:
     if mode in ["盘中", "收盘前大引不成"] and "盘中量价分" not in rank.columns:
         intra = download_intraday(tuple(STOCK_CODES))
         rank = apply_intraday_features(rank, intra)
+    if st.session_state.get("global_mode") != mode:
+        st.session_state.global_catalysts = compute_global_catalysts(raw_map, mode)
+        st.session_state.global_mode = mode
     rank = mode_score(rank, mode, budget)
     # Night PTS is automatically incorporated when a relevant overnight session is active.
     if mode in ["收盘后预测明天", "开盘前"] and _current_pts_session_start() is not None:
@@ -1863,6 +2288,13 @@ if rank is not None and not rank.empty:
         rank = apply_pts_features(rank, st.session_state.pts_map or {}, mode)
     else:
         rank = apply_pts_features(rank, {}, mode)
+
+    # Overseas catalyst is stock-specific and dynamic; no fixed "tech stock = Nasdaq" shortcut.
+    if st.session_state.global_catalysts is None:
+        st.session_state.global_catalysts = compute_global_catalysts(raw_map, mode)
+        st.session_state.global_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+    rank = apply_global_catalysts(rank, st.session_state.global_catalysts or {}, mode)
+
     if st.session_state.bt_map:
         rank = apply_backtest_calibration(rank, st.session_state.bt_map)
     else:
@@ -1883,7 +2315,7 @@ if rank is not None and not rank.empty:
     if final_grade.startswith("A"):
         st.success(
             f"**首选：{final_label}**｜{final_grade}｜综合分 {safe_float(top.get('综合分')):.1f}\n\n"
-            f"历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
+            f"历史：{hist_state}｜新闻：{news_state}｜海外：{str(top.get('海外催化状态','—'))}｜风险：{risk_label}"
         )
     elif final_grade.startswith("B+"):
         st.warning(
@@ -1898,7 +2330,7 @@ if rank is not None and not rank.empty:
     top_ns, top_news_label, top_news_items = force_news_check(str(top["代码"]))
     top["新闻分"] = top_ns
     top["新闻判断"] = top_news_label
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
     c1.metric("第一名", stock_label(str(top["代码"])))
     c2.metric(f"{mode}分", format_num(top["综合分"],1))
     c3.metric("背景 / 触发", f"{format_num(top['背景分'],0)} / {format_num(top['触发分'],0)}")
@@ -1908,7 +2340,9 @@ if rank is not None and not rank.empty:
         c6.metric("夜间PTS", f"{format_num(top.get('PTS涨跌%'))}%", help=str(top.get("PTS状态","")))
     else:
         c6.metric("夜间PTS", "—")
+    c7.metric("海外催化", f"{format_num(top.get('海外催化分'),1)}", help=f"{top.get('海外催化明细','—')}\n最新数据：{top.get('海外最新数据时间','—')}")
     st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
+    st.caption(f"海外关联：{top.get('海外催化明细','未发现足够可靠且新鲜的海外关联信号')}")
 
     if st.session_state.bt_map:
         st.caption("下面是辅助细节；如果你只想要结论，看上面的最终结论和止盈计划即可。")
@@ -1986,7 +2420,7 @@ if rank is not None and not rank.empty:
         st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","回调质量分","上方空间/支撑风险比","背景分","触发分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### 排名表")
-    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","追强资格","追强分","追强理由","追强风险","历史状态","历史校准分","次日上涨概率%","3日延续概率%","3日假突破风险%","相似样本","自身样本","PTS价格","PTS涨跌%","PTS成交量","PTS成交额","PTS可信度%","PTS调整分","PTS状态","PTS时间","新闻判断","风险标签"]
+    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","追强资格","追强分","追强理由","追强风险","历史状态","历史校准分","次日上涨概率%","3日延续概率%","3日假突破风险%","相似样本","自身样本","PTS价格","PTS涨跌%","PTS成交量","PTS成交额","PTS可信度%","PTS调整分","PTS状态","PTS时间","海外催化分","海外催化状态","海外有效因子数","海外最新数据时间","海外最新数据年龄分钟","海外催化明细","新闻判断","风险标签"]
     if mode in ["盘中", "收盘前大引不成"]:
         extras = ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]
         if mode == "收盘前大引不成":
@@ -1997,7 +2431,7 @@ if rank is not None and not rank.empty:
     # Some columns exist only after optional modules (e.g. backtest). Never crash the whole app for a missing display-only column.
     show_cols = [c for c in show_cols if c in rank.columns]
     display_df = rank.loc[:, show_cols].copy()
-    num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","历史状态","PTS状态","PTS时间","新闻判断","风险标签","追强理由","追强风险"]]
+    num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","历史状态","PTS状态","PTS时间","海外催化状态","海外最新数据时间","海外催化明细","新闻判断","风险标签","追强理由","追强风险"]]
     display_df[num_cols] = display_df[num_cols].round(2)
     st.dataframe(display_df, use_container_width=True, hide_index=True, height=620)
 
