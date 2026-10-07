@@ -1,6 +1,7 @@
 import math
 import re
 import time
+import random
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -13,7 +14,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="强势回踩选股大师", page_icon="📈", layout="wide")
+st.set_page_config(page_title="强势回踩点兵大师", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -28,6 +29,8 @@ RULES = [
     "类似 akippa：没有趋势、没有材料、没有惊喜，只靠突然暴拉，不追。",
     "关注新闻催化、最近走势、当前所处价位；新闻只作催化佐证，不替代价格确认。",
     "突然单日暴涨、明显远离短期均线时，即使评分高也增加追高惩罚。",
+    "优先考虑强势趋势中的小回调：跌一点不是买点本身，必须仍守住关键位，并保留重新转强的条件。",
+    "随机只用于合格候选之间的点兵，不允许把连续创新低、破位弱票随机成买入候选。",
 ]
 
 POSITIVE_KW = [
@@ -39,6 +42,54 @@ NEGATIVE_KW = [
     "下方修正","減益","減収","赤字","赤字転落","業績悪化","不正","調査","行政処分","訴訟","事故","リコール","減配",
     "希薄化","増資","MSワラント","新株予約権","公募増資","売出し","破産","民事再生","債務超過"
 ]
+
+
+
+# JPX normal daily price-limit table. The base price is normally the previous close / final quote.
+# Special widened limits can apply after certain consecutive limit sessions, so this is the normal-limit calculator only.
+JPX_LIMIT_TABLE = [
+    (100, 30), (200, 50), (500, 80), (700, 100), (1000, 150), (1500, 300),
+    (2000, 400), (3000, 500), (5000, 700), (7000, 1000), (10000, 1500),
+    (15000, 3000), (20000, 4000), (30000, 5000), (50000, 7000), (70000, 10000),
+    (100000, 15000), (150000, 30000), (200000, 40000), (300000, 50000), (500000, 70000),
+    (700000, 100000), (1000000, 150000), (1500000, 300000), (2000000, 400000),
+    (3000000, 500000), (5000000, 700000), (7000000, 1000000), (10000000, 1500000),
+    (15000000, 3000000), (20000000, 4000000), (30000000, 5000000), (50000000, 7000000),
+    (float("inf"), 10000000),
+]
+
+def jpx_normal_limit(base_price):
+    if base_price is None or not math.isfinite(base_price) or base_price <= 0:
+        return np.nan, np.nan, np.nan
+    width = next(w for upper, w in JPX_LIMIT_TABLE if base_price < upper)
+    return max(1, base_price - width), base_price + width, width
+
+def pullback_preference(day_pct, support_gap, from_h20, c, ma20):
+    """Reward a modest pullback only when the trend/support structure remains intact."""
+    s = 0.0
+    if math.isfinite(day_pct):
+        if -4.0 <= day_pct <= -0.5:
+            s += 9
+        elif -0.5 < day_pct <= 1.5:
+            s += 5
+        elif day_pct >= 6:
+            s -= 10
+        elif day_pct < -6:
+            s -= 10
+    if math.isfinite(support_gap):
+        if 0 <= support_gap <= 4:
+            s += 7
+        elif support_gap < 0:
+            s -= 14
+    if math.isfinite(from_h20):
+        draw = -from_h20
+        if 3 <= draw <= 10:
+            s += 6
+        elif draw > 18:
+            s -= 8
+    if math.isfinite(ma20) and c >= ma20:
+        s += 4
+    return float(np.clip(s, -25, 25))
 
 
 def ticker(code: str) -> str:
@@ -134,6 +185,7 @@ def analyze_daily(df: pd.DataFrame, code: str):
     volume_ratio = vol5 / vol20 if math.isfinite(vol5) and math.isfinite(vol20) and vol20 > 0 else np.nan
     last_vol_ratio = safe_float(vol.iloc[-1]) / vol20 if math.isfinite(vol20) and vol20 > 0 else np.nan
     rsi = safe_float(calc_rsi(close).iloc[-1])
+    limit_down, limit_up, limit_width = jpx_normal_limit(prev)
 
     # Trend quality: rising moving averages and positive medium-term momentum.
     ma20_prev5 = safe_float(close.rolling(20).mean().iloc[-6]) if len(close) >= 26 else np.nan
@@ -192,7 +244,8 @@ def analyze_daily(df: pd.DataFrame, code: str):
         if math.isfinite(dist_ma5) and dist_ma5 >= 5:
             penalties += 18; flags.append("突然暴拉且远离MA5，追高风险")
 
-    technical = strong_score + pullback_score + turn_score - penalties
+    safe_pullback_score = pullback_preference(r1, support_gap, from_h20, c, ma20)
+    technical = strong_score + pullback_score + turn_score + safe_pullback_score - penalties
     technical = float(np.clip(technical, -50, 100))
 
     return {
@@ -215,6 +268,10 @@ def analyze_daily(df: pd.DataFrame, code: str):
         "强势分": float(strong_score),
         "回踩分": float(pullback_score),
         "转强分": float(turn_score),
+        "安全回调分": float(safe_pullback_score),
+        "正常涨停价": limit_up,
+        "正常跌停价": limit_down,
+        "制限值幅": limit_width,
         "弱势惩罚": float(penalties),
         "技术总分": technical,
         "风险标签": "；".join(flags) if flags else "无明显弱势惩罚",
@@ -348,8 +405,8 @@ def chart_for(code, raw_df, support=None):
 
 
 # ---------- UI ----------
-st.title("📈 强势回踩选股大师")
-st.caption("规则引擎版 · 股票池固定 71 只 · 免费行情源 Yahoo Finance/yfinance（可能延迟，不保证交易所级实时）")
+st.title("🎲 强势回踩点兵大师")
+st.caption("规则 + 点兵版 · 股票池固定 72 只 · 免费行情源 Yahoo Finance/yfinance（可能延迟，不保证交易所级实时）")
 
 with st.expander("先看核心纪律（网站会强制执行）", expanded=True):
     for x in RULES:
@@ -374,7 +431,7 @@ if "news" not in st.session_state:
 
 left, right = st.columns([1, 2])
 with left:
-    if st.button("🚀 扫描 71 只股票", type="primary", use_container_width=True):
+    if st.button("🚀 扫描 72 只股票", type="primary", use_container_width=True):
         with st.spinner("正在拉取行情、计算趋势，并对前排候选精查新闻…"):
             rank, raw, news = scan_all(STOCK_CODES)
             st.session_state.scan = rank
@@ -397,8 +454,35 @@ if rank is not None and not rank.empty:
     c4.metric("结论", top["结论"])
     st.info(f"第一名 {top['代码']}：{top['风险标签']}；{top['新闻判断']}。注意：第一名也必须等实际盘口确认，不等于无脑买。")
 
+    # Fun layer: rules first, randomness second. Weak/broken names are never admitted to the draw.
+    st.markdown("#### 🎲 大师点兵：先过纪律，再交给一点运气")
+    eligible = rank[(rank["结论"].isin(["优先观察 / 可等确认", "观察"])) & (rank["弱势惩罚"] < 18)].copy()
+    if eligible.empty:
+        st.caption("今天没有足够合格的票，大师拒绝硬抽。")
+    else:
+        pool = eligible.head(min(8, len(eligible))).copy()
+        pool["点兵权重"] = np.maximum(pool["综合分"] - pool["综合分"].min() + 8, 1)
+        b1, b2 = st.columns([1, 2])
+        with b1:
+            if st.button("🎯 从合格前排里点一只", use_container_width=True):
+                choice = random.choices(pool["代码"].tolist(), weights=pool["点兵权重"].tolist(), k=1)[0]
+                st.session_state["master_pick"] = choice
+        with b2:
+            st.caption("不是 72 只瞎抽：先剔除破位、连续创新低和高风险弱票，只在前排合格候选里按评分加权随机。")
+        pick = st.session_state.get("master_pick")
+        if pick in pool["代码"].values:
+            pr = pool[pool["代码"] == pick].iloc[0]
+            st.success(f"今日点兵：**{pick}**｜综合分 {pr['综合分']:.1f}｜安全回调分 {pr['安全回调分']:.1f}｜{pr['结论']}")
+
+    st.markdown("#### 🛡️ 回调埋伏候选")
+    dip = rank[(rank["安全回调分"] >= 10) & (rank["强势分"] >= 8) & (rank["弱势惩罚"] < 18)].sort_values(["安全回调分","综合分"], ascending=False).head(8)
+    if dip.empty:
+        st.caption("今天没有满足‘强势 + 小回调 + 守支撑’的明显候选。")
+    else:
+        st.dataframe(dip[["代码","现价","日涨跌%","20日%","距支撑%","距20日高%","安全回调分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
+
     st.markdown("#### 排名表")
-    show_cols = ["代码","结论","综合分","现价","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","强势分","回踩分","转强分","弱势惩罚","新闻判断","风险标签"]
+    show_cols = ["代码","结论","综合分","现价","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","强势分","回踩分","转强分","安全回调分","弱势惩罚","新闻判断","风险标签"]
     display_df = rank[show_cols].copy()
     num_cols = [c for c in show_cols if c not in ["代码","结论","新闻判断","风险标签"]]
     display_df[num_cols] = display_df[num_cols].round(2)
@@ -435,6 +519,11 @@ if rank is not None and not rank.empty:
     m4.metric("距支撑", f"{format_num(row['距支撑%'])}%")
     m5.metric("综合分", format_num(row["综合分"]))
     st.write(f"**结论：{row['结论']}**｜{row['风险标签']}｜{row['新闻判断']}")
+    p1,p2,p3 = st.columns(3)
+    p1.metric("通常涨停价", format_num(row["正常涨停价"],1))
+    p2.metric("通常跌停价", format_num(row["正常跌停价"],1))
+    p3.metric("制限值幅", f"±{format_num(row['制限值幅'],1)} 円")
+    st.caption("涨跌停按东证通常制限值幅、以前一交易日基准价估算；连续无成交封板等情形可能触发次日扩大制限值幅，应以 JPX 当日公告为准。")
     if selected in raw_map:
         st.plotly_chart(chart_for(selected, raw_map[selected], row["关键支撑"]), use_container_width=True)
     if selected in news_map:
@@ -449,9 +538,9 @@ if rank is not None and not rank.empty:
     else:
         st.caption("暂未抓到公开新闻；不要把‘没抓到’理解成‘公司没有新闻’。")
 else:
-    st.info("点击上面的“扫描 71 只股票”开始。首次加载可能稍慢。")
+    st.info("点击上面的“扫描 72 只股票”开始。首次加载可能稍慢。")
 
-with st.expander("股票池（71只）"):
+with st.expander("股票池（72只）"):
     st.code("\n".join(STOCK_CODES), language="text")
 
 with st.expander("评分怎么判"):
@@ -460,8 +549,10 @@ with st.expander("评分怎么判"):
 **2. 回踩不破**：价格靠近 MA20/近10日支撑，但没有有效跌破；从20日高点适度回撤比高位硬追更好。  
 **3. 再次转强**：收盘重新越过前一日高点、连续回升、上涨同时伴随合理放量。  
 **4. akippa式弱票惩罚**：接近/刷新20日低点、近期低点连续下移、5日/20日持续走弱、放量不涨。  
-**5. 追高惩罚**：单日突然大涨且明显远离 MA5，直接扣分。  
-**6. 新闻**：只对前排候选精查公开新闻，识别上方修正、受注、提携、自社株买、增配等潜在催化，以及下方修正、增资、MS warrant 等风险词。新闻不会覆盖掉技术面硬伤。
+**5. 安全回调偏好**：强趋势中，小幅回落约 0.5%～4%、仍在支撑/MA20 上方、距离20日高点有适度空间，会额外加分；大跌破位不会因为“便宜”而加分。  
+**6. 追高惩罚**：单日突然大涨且明显远离 MA5，直接扣分。  
+**7. 日股涨跌停**：按 JPX 通常制限值幅计算正常涨停/跌停价；特殊扩大幅度日以 JPX 公告为准。  
+**8. 新闻**：只对前排候选精查公开新闻，识别上方修正、受注、提携、自社株买、增配等潜在催化，以及下方修正、增资、MS warrant 等风险词。新闻不会覆盖掉技术面硬伤。
 """)
 
-st.caption("数据说明：Yahoo Finance/yfinance 为免费公开数据入口，不是东京证券交易所官方低延迟行情。新闻来自 Google News RSS。")
+st.caption("数据说明：Yahoo Finance/yfinance 为免费公开数据入口，不是东京证券交易所官方低延迟行情。新闻来自 Google News RSS。东证通常制限值幅规则按 JPX 公布表计算；连续封板等特殊扩大情形不由免费行情自动识别。")
