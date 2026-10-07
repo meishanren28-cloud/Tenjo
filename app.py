@@ -17,7 +17,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 import json
 
-st.set_page_config(page_title="四时段强势回踩大师 V20.5", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V20.6", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -285,7 +285,7 @@ def reward_risk_proxy(from_h20, support_gap, pullback_quality):
 def affordability_score(price, budget=300000):
     """Capital friendliness for a standard 100-share cash lot.
 
-    V20.5: moderately stronger than before and relative to the user's actual budget.
+    V20.6: moderately stronger than before and relative to the user's actual budget.
     Cheapness can separate otherwise comparable candidates, but never rescues a weak stock.
     Maximum bonus is 14 points.
     """
@@ -1244,7 +1244,7 @@ def scan_all(codes, budget=300000):
             ns, label, _items = news_map[c]
             base.at[idx, "新闻分"] = ns
             base.at[idx, "新闻判断"] = label
-            base.at[idx, "综合排名分"] = float(np.clip(base.at[idx, "技术总分"] + ns, -50, 100))
+            base.at[idx, "综合分"] = float(np.clip(base.at[idx, "技术总分"] + ns, -50, 100))
     base["结论"] = base.apply(classify, axis=1)
     bo = base.apply(lambda r: breakout_chase_score(r), axis=1)
     base["追强分"] = [x[0] for x in bo]
@@ -1254,7 +1254,7 @@ def scan_all(codes, budget=300000):
 
     # Only healthy/neutral candidates can receive the affordability bonus. Weak names never get rescued by low price.
     good_mask = base["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
-    base.loc[good_mask, "综合排名分"] = (base.loc[good_mask, "综合排名分"] + base.loc[good_mask, "资金友好分"]).clip(-50, 100)
+    base.loc[good_mask, "综合分"] = (base.loc[good_mask, "综合分"] + base.loc[good_mask, "资金友好分"]).clip(-50, 100)
     base = base.sort_values(["综合分", "背景分", "触发分", "一手资金"], ascending=[False, False, False, True]).reset_index(drop=True)
     return base, raw, news_map
 
@@ -2253,8 +2253,8 @@ def apply_global_catalysts(rank: pd.DataFrame, catalyst_map: dict, mode: str):
 
 
 
-# ---------- V20.5: frozen Top5 predictions / pullback plans / optional persistent memory ----------
-MODEL_VERSION = "V20.5.1"
+# ---------- V20.6: frozen Top5 predictions / pullback plans / optional persistent memory ----------
+MODEL_VERSION = "V21"
 
 def prediction_validation_rule(mode: str) -> str:
     return {
@@ -2326,13 +2326,35 @@ def pullback_buy_plan(row):
 
     high = min(high, current * 0.997)
     low = min(low, high)
+
+    # Do not let the buy zone collapse into a single-point pseudo-precision.
+    # Keep a minimum width of max(0.35% of price, 0.12 ATR).
+    min_zone_width = max(current * 0.0035, atr_abs * 0.12)
+    if high - low < min_zone_width:
+        mid = (high + low) / 2.0
+        low = mid - min_zone_width / 2.0
+        high = mid + min_zone_width / 2.0
+        high = min(high, current * 0.997)
+        low = min(low, high - min_zone_width * 0.75)
+
     center = (low + high) / 2.0
 
-    # Keep the short alert meaningfully below the buy zone but above deep structural invalidation.
-    short_alert = min(short_alert, low - 0.10 * atr_abs)
-    if math.isfinite(structural_invalid):
-        short_alert = max(short_alert, structural_invalid + 0.25 * atr_abs)
-    short_alert = min(short_alert, low * 0.998)
+    # Risk levels must be ordered:
+    # buy zone > short-term alert > structural invalidation.
+    short_alert = min(short_alert, low - max(0.10 * atr_abs, current * 0.0025))
+
+    if not math.isfinite(structural_invalid):
+        structural_invalid = short_alert - max(0.55 * atr_abs, current * 0.01)
+
+    # Structural invalidation must sit clearly below the short-term alert.
+    structural_invalid = min(
+        structural_invalid,
+        short_alert - max(0.30 * atr_abs, current * 0.0075)
+    )
+
+    # Final hard ordering guards.
+    short_alert = min(short_alert, low * 0.997)
+    structural_invalid = min(structural_invalid, short_alert * 0.995)
 
     return {
         "类型":plan_type,
@@ -2346,14 +2368,35 @@ def pullback_buy_plan(row):
         "说明":note,
     }
 
+
+def validate_buy_plan(plan):
+    issues = []
+    lo = safe_float(plan.get("回踩下沿"))
+    hi = safe_float(plan.get("回踩上沿"))
+    alert = safe_float(plan.get("短线警戒位"))
+    structural = safe_float(plan.get("结构失效位"))
+
+    if all(math.isfinite(x) for x in [lo, hi]) and not (lo < hi):
+        issues.append("买入区间宽度异常")
+    if all(math.isfinite(x) for x in [lo, alert]) and not (alert < lo):
+        issues.append("短线警戒位未低于买入区")
+    if all(math.isfinite(x) for x in [alert, structural]) and not (structural < alert):
+        issues.append("结构失效位未低于短线警戒")
+    return "OK" if not issues else "；".join(issues)
+
 def build_top5_snapshot(rank: pd.DataFrame, mode: str, run_id: str, analysis_time: str) -> pd.DataFrame:
     rows = []
-    for pos, (_, r) in enumerate(rank.head(5).iterrows(), start=1):
+    _src = rank[rank.get("推荐资格", pd.Series(True, index=rank.index)) == True].copy() if "推荐资格" in rank.columns else rank.copy()
+    if _src.empty:
+        _src = rank.copy()
+    for pos, (_, r) in enumerate(_src.head(5).iterrows(), start=1):
         price = safe_float(r.get("盘中现价", np.nan))
         if not math.isfinite(price):
             price = safe_float(r.get("现价", np.nan))
-        tp = take_profit_targets(r, price if math.isfinite(price) else None)
         pb = pullback_buy_plan(r)
+        planned_entry = safe_float(pb.get("回踩中心", np.nan))
+        tp = take_profit_targets(r, planned_entry if math.isfinite(planned_entry) else price)
+        audit = audit_candidate_plan(r, mode)
 
         # Freeze the important features too, so tomorrow's explanation cannot silently change.
         frozen = {
@@ -2410,6 +2453,13 @@ def build_top5_snapshot(rank: pd.DataFrame, mode: str, run_id: str, analysis_tim
             "短线警戒位": pb["短线警戒位"],
             "结构失效位": pb["结构失效位"],
             "失效位": pb["失效位"],
+            "买入计划校验": validate_buy_plan(pb),
+            "一致性状态": audit["一致性状态"],
+            "一致性硬错误": audit["一致性硬错误"],
+            "一致性警告": audit["一致性警告"],
+            "计划质量分": audit["计划质量分"],
+            "推荐资格": audit["推荐资格"],
+            "计划参考买入价": planned_entry,
             "历史置信度": historical_confidence_label(r),
             "第一止盈": safe_float(tp.get("第一止盈")),
             "强势目标": safe_float(tp.get("强势续抱目标")),
@@ -2505,7 +2555,7 @@ def load_recent_predictions_supabase(limit=100):
 
 
 
-# ---------- V20.5: upload yesterday's frozen CSV and grade it automatically ----------
+# ---------- V20.6: upload yesterday's frozen CSV and grade it automatically ----------
 def _parse_jst_time(s):
     try:
         s = str(s).replace(" JST","")
@@ -2623,6 +2673,8 @@ def grade_prediction_row(r):
     tp1 = safe_float(r.get("第一止盈"))
     tp2 = safe_float(r.get("强势目标"))
     invalid = safe_float(r.get("失效位"))
+    short_alert = safe_float(r.get("短线警戒位"))
+    structural_invalid = safe_float(r.get("结构失效位"))
     buy_low = safe_float(r.get("回踩买入下沿"))
     buy_high = safe_float(r.get("回踩买入上沿"))
 
@@ -2634,7 +2686,16 @@ def grade_prediction_row(r):
         eval_date = pred_ts.date()
     else:
         if mode == "开盘前":
-            eval_date = pred_ts.date()
+            # Before 09:00: target the same trading day IF that day actually traded.
+            # At night/after the market has opened: "开盘前" means the NEXT trading day.
+            if pred_ts.hour < 9:
+                same_start = str(pred_ts.date())
+                same_end = str((pd.Timestamp(pred_ts.date()) + pd.Timedelta(days=1)).date())
+                same_daily = fetch_daily_for_verify(code, same_start, same_end)
+                same_ohlc = _one_day_ohlc(same_daily, pred_ts.date())
+                eval_date = pred_ts.date() if same_ohlc else _next_jp_trading_day(code, pred_ts.date())
+            else:
+                eval_date = _next_jp_trading_day(code, pred_ts.date())
         else:
             eval_date = _next_jp_trading_day(code, pred_ts.date())
 
@@ -2662,6 +2723,8 @@ def grade_prediction_row(r):
     tp1_hit = math.isfinite(tp1) and math.isfinite(high) and high >= tp1
     tp2_hit = math.isfinite(tp2) and math.isfinite(high) and high >= tp2
     invalid_hit = math.isfinite(invalid) and math.isfinite(low) and low <= invalid
+    short_alert_hit = math.isfinite(short_alert) and math.isfinite(low) and low <= short_alert
+    structural_hit = math.isfinite(structural_invalid) and math.isfinite(low) and low <= structural_invalid
 
     # Pre-committed grading, no after-the-fact explanations.
     if invalid_hit and not tp1_hit:
@@ -2707,6 +2770,8 @@ def grade_prediction_row(r):
         "回踩买入区间触及":bool(buy_touch),
         "第一止盈命中":bool(tp1_hit),
         "强势目标命中":bool(tp2_hit),
+        "短线警戒触及":bool(short_alert_hit),
+        "大结构失效触及":bool(structural_hit),
         "失效位触及":bool(invalid_hit),
         "低点后收盘反弹%":rebound,
         "判卷结果":result,
@@ -2724,7 +2789,7 @@ def verify_prediction_csv(uploaded_file):
     required = ["预测时间","模式","排名","代码","预测价格","第一止盈","强势目标","失效位"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        return None, "不是V20/V20.5预测CSV，缺少：" + "、".join(missing)
+        return None, "不是V20/V20.6预测CSV，缺少：" + "、".join(missing)
 
     results = []
     for _, row in df.iterrows():
@@ -2747,9 +2812,15 @@ def buy_action_from_plan(row, mode=None):
     ref_source = "东证现价/收盘"
 
     # For next-session decisions, a valid PTS quote is fresher than TSE close.
-    if mode in ["开盘前", "收盘后预测明天"] and math.isfinite(pts) and "过期" not in pts_status:
+    if (
+        mode in ["开盘前", "收盘后预测明天"]
+        and math.isfinite(pts)
+        and "过期" not in pts_status
+        and math.isfinite(pts_conf)
+        and pts_conf >= 20
+    ):
         current = pts
-        ref_source = "夜间PTS"
+        ref_source = "夜间PTS（可信度≥20%）"
 
     lo = safe_float(pb.get("回踩下沿"))
     hi = safe_float(pb.get("回踩上沿"))
@@ -2777,8 +2848,180 @@ def buy_action_from_plan(row, mode=None):
     }
 
 
+
+# ---------- V21 consistency engine ----------
+def _plan_entry_price(plan):
+    return safe_float(plan.get("回踩中心", np.nan))
+
+def audit_candidate_plan(row, mode):
+    """Fail closed: contradictory plans are never presented as normal recommendations."""
+    plan = pullback_buy_plan(row)
+    action = buy_action_from_plan(row, mode)
+    entry = _plan_entry_price(plan)
+    tp = take_profit_targets(row, entry if math.isfinite(entry) else None)
+
+    lo = safe_float(plan.get("回踩下沿"))
+    hi = safe_float(plan.get("回踩上沿"))
+    alert = safe_float(plan.get("短线警戒位"))
+    structural = safe_float(plan.get("结构失效位"))
+    tp1 = safe_float(tp.get("第一止盈"))
+    tp2 = safe_float(tp.get("强势续抱目标"))
+    ref = safe_float(action.get("当前参考价"))
+    atr_pct = safe_float(row.get("ATR14%", np.nan))
+
+    hard = []
+    warn = []
+
+    # Core numerical invariants.
+    if not all(math.isfinite(x) and x > 0 for x in [lo, hi, alert, structural, entry, tp1, tp2]):
+        hard.append("交易计划存在缺失/非数值")
+    else:
+        if not lo < hi:
+            hard.append("买入区间上下沿倒置/重合")
+        if not structural < alert < lo < hi:
+            hard.append("风险层级必须满足：结构失效 < 短线警戒 < 买入区")
+        if not tp1 > entry:
+            hard.append("第一止盈未高于计划买入价")
+        if not tp2 > tp1:
+            hard.append("强势目标未高于第一止盈")
+
+        zone_pct = (hi / lo - 1) * 100 if lo > 0 else np.nan
+        if math.isfinite(zone_pct) and zone_pct < 0.20:
+            hard.append("买入区过窄，存在伪精确")
+        elif math.isfinite(zone_pct) and zone_pct > 4.0:
+            warn.append("买入区偏宽")
+
+        short_risk = entry - alert
+        reward1 = tp1 - entry
+        rr1 = reward1 / short_risk if short_risk > 0 else np.nan
+        if not math.isfinite(rr1) or rr1 <= 0:
+            hard.append("第一止盈/短线风险盈亏比无效")
+        elif rr1 < 0.70:
+            hard.append(f"第一止盈相对短线风险过差（RR {rr1:.2f}）")
+        elif rr1 < 1.10:
+            warn.append(f"第一目标盈亏比偏低（RR {rr1:.2f}）")
+
+        structural_risk_pct = (entry / structural - 1) * 100 if structural > 0 else np.nan
+        if math.isfinite(structural_risk_pct) and structural_risk_pct > 12:
+            warn.append(f"大结构止损距离较宽（{structural_risk_pct:.1f}%）")
+
+    # Reference-price / action consistency.
+    action_text = str(action.get("动作", ""))
+    if math.isfinite(ref) and math.isfinite(alert) and ref < alert and "警戒" not in action_text:
+        hard.append("参考价已跌破警戒位，但动作没有取消低吸")
+    if math.isfinite(ref) and math.isfinite(lo) and math.isfinite(hi):
+        if lo <= ref <= hi and not ("观察区" in action_text or "买入" in action_text):
+            hard.append("参考价已进入买入区，但动作文字不一致")
+
+    # Historical evidence is a warning, never confused with rank score.
+    hist_conf = historical_confidence_label(row)
+    if hist_conf.startswith("🔴"):
+        warn.append("历史相似样本偏差")
+    elif hist_conf.startswith("⚪"):
+        warn.append("历史证据仅中性/不足")
+
+    # High fake-breakout history deserves an explicit warning.
+    fake = safe_float(row.get("3日假突破风险%", np.nan))
+    if math.isfinite(fake) and fake >= 50:
+        warn.append(f"历史假突破风险偏高（{fake:.1f}%）")
+
+    # Plans already below short alert are not actionable even if numerically coherent.
+    actionable = len(hard) == 0
+    if math.isfinite(ref) and math.isfinite(alert) and ref < alert:
+        actionable = False
+        warn.append("当前参考价已低于短线警戒，等待重新收回")
+
+    if hard:
+        status = "❌ 计划自检失败"
+    elif not actionable:
+        status = "⚠️ 计划暂不可执行"
+    elif warn:
+        status = "🟡 自检通过但有警告"
+    else:
+        status = "✅ 一致性通过"
+
+    # A transparent quality score; not a win probability.
+    q = 100.0
+    q -= 35.0 * len(hard)
+    q -= 8.0 * len(warn)
+    q = float(np.clip(q, 0, 100))
+
+    return {
+        "计划": plan,
+        "动作": action,
+        "止盈": tp,
+        "一致性状态": status,
+        "一致性硬错误": "；".join(hard) if hard else "—",
+        "一致性警告": "；".join(warn) if warn else "—",
+        "计划质量分": q,
+        "推荐资格": bool(actionable and not hard),
+    }
+
+def apply_consistency_gate(rank: pd.DataFrame, mode: str):
+    """Audit EVERY candidate before ranking. Bad plans fail closed."""
+    r = rank.copy()
+    statuses, hard_errors, warnings, qualities, eligible = [], [], [], [], []
+
+    for _, row in r.iterrows():
+        a = audit_candidate_plan(row, mode)
+        statuses.append(a["一致性状态"])
+        hard_errors.append(a["一致性硬错误"])
+        warnings.append(a["一致性警告"])
+        qualities.append(a["计划质量分"])
+        eligible.append(a["推荐资格"])
+
+    r["一致性状态"] = statuses
+    r["一致性硬错误"] = hard_errors
+    r["一致性警告"] = warnings
+    r["计划质量分"] = qualities
+    r["推荐资格"] = eligible
+
+    # Hard contradictions are heavily demoted. Warnings are mild, not a blanket conservative veto.
+    hard_mask = r["一致性状态"].eq("❌ 计划自检失败")
+    wait_mask = r["一致性状态"].eq("⚠️ 计划暂不可执行")
+    warn_mask = r["一致性状态"].eq("🟡 自检通过但有警告")
+
+    r.loc[hard_mask, "综合分"] = (r.loc[hard_mask, "综合分"].astype(float) - 40).clip(-50,100)
+    r.loc[wait_mask, "综合分"] = (r.loc[wait_mask, "综合分"].astype(float) - 14).clip(-50,100)
+    r.loc[warn_mask, "综合分"] = (r.loc[warn_mask, "综合分"].astype(float) - 3).clip(-50,100)
+
+    # Sort actionable + internally consistent candidates first.
+    r = r.sort_values(
+        ["推荐资格","综合分","计划质量分","回调质量分","背景分","一手资金"],
+        ascending=[False,False,False,False,False,True]
+    ).reset_index(drop=True)
+    return r
+
+def mode_time_context(mode, now=None):
+    now = now or datetime.now(JST)
+    hm = now.hour * 60 + now.minute
+    if mode == "开盘前":
+        if hm < 9*60:
+            return "✅ 当前处于盘前时段：本次验证目标通常是今天。"
+        if hm >= 15*60 + 30:
+            return "ℹ️ 当前已收盘：你是在提前做下一交易日的盘前筛选；明早8:20～8:55再刷新一次会更完整。"
+        return "⚠️ 当前市场已开盘：若要判断现在买哪个，请切到『盘中』。"
+    if mode == "盘中":
+        return "✅ 盘中模式只评价点击分析之后的走势，验证不会偷用预测之前的高点。"
+    if mode == "收盘前大引不成":
+        return "ℹ️ 该模式最适合15:15～15:24左右运行。"
+    return "ℹ️ 收盘后模式用于预测下一交易日；夜间PTS和海外数据会继续作为辅助。"
+
+def run_plan_invariant_selftest():
+    """Tiny deterministic engine test. If this fails, recommendation UI should warn."""
+    good = {"回踩下沿":100.0,"回踩上沿":103.0,"短线警戒位":97.0,"结构失效位":92.0}
+    bad = {"回踩下沿":100.0,"回踩上沿":100.0,"短线警戒位":101.0,"结构失效位":102.0}
+    good_ok = (
+        good["结构失效位"] < good["短线警戒位"] < good["回踩下沿"] < good["回踩上沿"]
+    )
+    bad_rejected = not (
+        bad["结构失效位"] < bad["短线警戒位"] < bad["回踩下沿"] < bad["回踩上沿"]
+    )
+    return bool(good_ok and bad_rejected)
+
+
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V20.5")
+st.title("🎲 四时段强势回踩资金友好大师 V21")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -2833,6 +3076,12 @@ if "prediction_saved_runs" not in st.session_state:
 st.markdown("### 🕒 分析时段")
 mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘前大引不成", "收盘后预测明天"], horizontal=True)
 st.info(MODE_DESCRIPTIONS[mode])
+st.caption(mode_time_context(mode))
+_engine_ok = run_plan_invariant_selftest()
+if _engine_ok:
+    st.caption("🧠 交易计划引擎自检：✅ 基础不变量通过。最终Top5还会逐只再次审查。")
+else:
+    st.error("❌ 交易计划引擎基础自检失败：本轮不应采信推荐。")
 
 st.markdown("### 💴 资金偏好")
 budget = st.slider("单只股票最多愿意占用多少一手资金？", 100000, 1000000, 300000, 50000, format="¥%d")
@@ -2867,7 +3116,7 @@ with st.expander("📊 昨日/历史预测判卷（把CSV拖这里）", expanded
             "回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
             "验证日期","实际开盘","实际最高","实际最低","实际收盘",
             "最大浮盈%","最大浮亏%","收盘收益%","回踩买入区间触及",
-            "第一止盈命中","强势目标命中","失效位触及","低点后收盘反弹%","判卷结果","自动纠因标签"
+            "第一止盈命中","强势目标命中","短线警戒触及","大结构失效触及","低点后收盘反弹%","判卷结果","自动纠因标签"
         ] if c in verified_df.columns]
         view = verified_df[show_cols].copy()
         for c in ["预测价格","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
@@ -2938,7 +3187,7 @@ if st.button("🧠 全自动分析", type="primary", use_container_width=True):
         st.session_state.bt_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
 
 st.caption(
-    f"当前模式：{mode}。每次点击『全自动分析』都会生成并冻结本模式Top5：当时价格、回踩买入区间、止盈、失效位和关键指标都一起记录，方便之后按真实走势验算。"
+    f"当前模式：{mode}。每次分析先做全候选一致性审查，再生成Top5。网站会记录和判卷，但不会擅自改规则；实战结果用于下一版人工/ChatGPT修正模型。"
 )
 
 rank = st.session_state.scan
@@ -2973,10 +3222,19 @@ if rank is not None and not rank.empty:
     if st.session_state.bt_map:
         rank = apply_backtest_calibration(rank, st.session_state.bt_map)
     else:
-        rank["综合分"] = rank["模式分"]  # backward-compatible display name
+        rank["综合分"] = rank["模式分"]  # internal score field
+
+    # Final fail-closed audit. Nothing is recommended before this passes.
+    rank = apply_consistency_gate(rank, mode)
     heading = {"开盘前":"今天开盘前优先盯谁", "盘中":"盘中现在优先看谁", "收盘前大引不成":"收盘前大引不成优先候选", "收盘后预测明天":"明天优先观察谁"}[mode]
     st.subheader(heading)
-    top = rank.iloc[0].copy()
+
+    _eligible = rank[rank["推荐资格"] == True].copy()
+    if _eligible.empty:
+        top = rank.iloc[0].copy()
+        st.error("❌ 今天没有候选同时通过交易计划一致性审查。宁可不给推荐，也不输出自相矛盾的买点。")
+    else:
+        top = _eligible.iloc[0].copy()
 
 
     st.markdown("### ✅ 最终结论")
@@ -2986,21 +3244,24 @@ if rank is not None and not rank.empty:
     pts_state = str(top.get("PTS状态", "—"))
     news_state = str(top.get("新闻判断", "—"))
     risk_label = str(top.get("风险标签", "—"))
+    consistency_state = str(top.get("一致性状态", "—"))
+    consistency_warn = str(top.get("一致性警告", "—"))
+    rank_score = safe_float(top.get("综合分"))
 
     if final_grade.startswith("A"):
         st.success(
-            f"**首选：{final_label}**｜{final_grade}｜综合排名分 {safe_float(top.get('综合排名分')):.1f}\n\n"
-            f"历史：{hist_state}｜新闻：{news_state}｜海外：{str(top.get('海外催化状态','—'))}｜风险：{risk_label}"
+            f"**首选：{final_label}**｜{final_grade}｜综合排名分 {rank_score:.1f}\n\n"
+            f"历史：{hist_state}｜一致性：{consistency_state}｜新闻：{news_state}｜海外：{str(top.get('海外催化状态','—'))}｜风险：{risk_label}"
         )
     elif final_grade.startswith("B+"):
         st.warning(
-            f"**优先观察：{final_label}**｜{final_grade}｜综合排名分 {safe_float(top.get('综合排名分')):.1f}\n\n"
-            f"还差一次明确转强确认。历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
+            f"**优先观察：{final_label}**｜{final_grade}｜综合排名分 {rank_score:.1f}\n\n"
+            f"还差一次明确转强确认。历史：{hist_state}｜一致性：{consistency_state}｜新闻：{news_state}｜风险：{risk_label}"
         )
     else:
         st.info(
-            f"**当前没有很强的买点。排名第一：{final_label}**｜{final_grade}｜综合排名分 {safe_float(top.get('综合排名分')):.1f}\n\n"
-            f"不要为了必须买而硬买。历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
+            f"**当前没有很强的买点。排名第一：{final_label}**｜{final_grade}｜综合排名分 {rank_score:.1f}\n\n"
+            f"不要为了必须买而硬买。历史：{hist_state}｜一致性：{consistency_state}｜新闻：{news_state}｜风险：{risk_label}"
         )
     top_ns, top_news_label, top_news_items = force_news_check(str(top["代码"]))
     top["新闻分"] = top_ns
@@ -3022,8 +3283,10 @@ if rank is not None and not rank.empty:
     st.caption(f"海外关联：{top.get('海外催化明细','未发现足够可靠且新鲜的海外关联信号')}")
 
     # Direct buy plan for the recommended No.1 name.
-    top_buy = buy_action_from_plan(top, mode)
+    top_audit = audit_candidate_plan(top, mode)
+    top_buy = top_audit["动作"]
     st.markdown("#### 💰 第一名怎么买")
+    st.caption(f"{top_audit['一致性状态']}｜计划质量 {top_audit['计划质量分']:.0f}/100｜警告：{top_audit['一致性警告']}")
 
     _ref_txt = f"¥{top_buy['当前参考价']:.0f}" if math.isfinite(top_buy["当前参考价"]) else "—"
     _tse_txt = f"¥{top_buy['东证价']:.0f}" if math.isfinite(top_buy["东证价"]) else "—"
@@ -3071,7 +3334,7 @@ if rank is not None and not rank.empty:
         st.caption(f"预测时间：{_analysis_time}｜{prediction_validation_rule(mode)}")
         top5_cols = [
             "排名","代码","日文名","中文名","预测价格","综合分","结论",
-            "买入计划类型","买入动作","回踩买入下沿","回踩买入上沿","短线警戒位","结构失效位","第一止盈","强势目标","历史置信度","风险"
+            "买入计划类型","买入动作","回踩买入下沿","回踩买入上沿","短线警戒位","结构失效位","一致性状态","计划质量分","第一止盈","强势目标","历史置信度","风险"
         ]
         top5_view = snap[top5_cols].copy()
         for c in ["预测价格","综合分","回踩买入下沿","回踩买入上沿","短线警戒位","结构失效位","第一止盈","强势目标"]:
@@ -3139,7 +3402,7 @@ if rank is not None and not rank.empty:
         if breakout_pool.empty:
             st.caption("今天没有股票通过『强势突破追强』风险门槛。宁可不追，也不把弱票突然暴拉当成主升突破。")
         else:
-            breakout_pool = breakout_pool.sort_values(["追强分","综合排名分"], ascending=False).head(8)
+            breakout_pool = breakout_pool.sort_values(["追强分","综合分"], ascending=False).head(8)
             breakout_pool["回踩计划"] = breakout_pool.apply(lambda rr: pullback_buy_plan(rr), axis=1)
             breakout_pool["回踩买入下沿"] = breakout_pool["回踩计划"].apply(lambda x: x["回踩下沿"])
             breakout_pool["回踩买入上沿"] = breakout_pool["回踩计划"].apply(lambda x: x["回踩上沿"])
@@ -3172,7 +3435,7 @@ if rank is not None and not rank.empty:
             st.success(f"今日点兵：**{stock_label(pick)}**｜综合排名分 {pr['综合分']:.1f}｜安全回调分 {pr['安全回调分']:.1f}｜{pr['结论']}")
 
     st.markdown("#### 🛡️ 回调埋伏候选")
-    dip = rank[(rank["回调质量分"] >= 14) & (rank["背景分"] >= 22) & (rank["风险总惩罚"] < 18)].sort_values(["回调质量分","空间盈亏比分","综合排名分"], ascending=False).head(8)
+    dip = rank[(rank["回调质量分"] >= 14) & (rank["背景分"] >= 22) & (rank["风险总惩罚"] < 18)].sort_values(["回调质量分","空间盈亏比分","综合分"], ascending=False).head(8)
     if dip.empty:
         st.caption("今天没有满足‘强势 + 小回调 + 守支撑’的明显候选。")
     else:
@@ -3246,7 +3509,7 @@ if rank is not None and not rank.empty:
     m3.metric("背景 / 触发", f"{format_num(row['背景分'],0)} / {format_num(row['触发分'],0)}")
     m4.metric("距支撑", f"{format_num(row['距支撑%'])}%")
     m5.metric("ATR14", f"{format_num(row['ATR14%'])}%")
-    m6.metric("综合分", format_num(row["综合分"]))
+    m6.metric("综合排名分", format_num(row["综合分"]))
     st.write(f"**结论：{row['结论']}**｜{row['风险标签']}｜{row['新闻判断']}")
 
 
@@ -3275,7 +3538,9 @@ if rank is not None and not rank.empty:
     st.caption("涨跌停按东证通常制限值幅、以前一交易日基准价估算；连续无成交封板等情形可能触发次日扩大制限值幅，应以 JPX 当日公告为准。")
 
     pb_single = pullback_buy_plan(row)
+    single_audit = audit_candidate_plan(row, mode)
     st.markdown("### 🪂 回踩买入计划（预测时固定）")
+    st.caption(f"{single_audit['一致性状态']}｜计划质量 {single_audit['计划质量分']:.0f}/100｜{single_audit['一致性警告']}")
     pb1,pb2,pb3,pb4 = st.columns(4)
     pb1.metric("计划类型", pb_single["类型"])
     pb2.metric("回踩买入区间", f"¥{pb_single['回踩下沿']:.0f} ～ ¥{pb_single['回踩上沿']:.0f}" if math.isfinite(pb_single["回踩下沿"]) else "—")
