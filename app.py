@@ -14,7 +14,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V12", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V14", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -104,7 +104,7 @@ RULES = [
     "原本就强 + 健康回踩不破关键位 + 再次转强，才考虑买；同等质量优先上方空间更大、下方支撑更近的候选。",
     "连续创新低、收盘重心持续下移的弱票，直接重罚；不能因为“跌很多了”就自动抄底。",
     "有量不等于强：如果放量但价格不涨、冲高回落、收盘仍弱，视为派发/承接不足风险。",
-    "类似 akippa：没有趋势、没有材料、没有惊喜，只靠突然暴拉，不追。",
+    "弱势结构里的突然暴拉不追；但强趋势、接近/突破前高、涨幅留存好且风险门槛通过的真突破，允许追强。",
     "关注新闻催化、最近走势、当前所处价位；新闻只作催化佐证，不替代价格确认。",
     "突然单日暴涨、明显远离短期均线时，即使评分高也增加追高惩罚。",
     "优先考虑强势趋势中的小回调：跌一点不是买点本身，必须仍守住关键位，并保留重新转强的条件。",
@@ -905,6 +905,116 @@ def render_take_profit_banner(tp, is_recommended=True, note=None):
     </div>
     """, unsafe_allow_html=True)
 
+
+def breakout_chase_score(row):
+    """Strict breakout-chase gate using already-computed metrics.
+    Allows true strong breakouts, rejects weak-stock fake pops.
+    """
+    score = 0.0
+    reasons, risks = [], []
+
+    r20 = safe_float(row.get("20日%", np.nan))
+    r5 = safe_float(row.get("5日%", np.nan))
+    from_h20 = safe_float(row.get("距20日高%", np.nan))
+    retention = safe_float(row.get("近10日冲高保留率%", np.nan))
+    failed = int(row.get("冲高失败次数", 0) or 0)
+    weak_pen = safe_float(row.get("弱势惩罚", 0))
+    risk_pen = safe_float(row.get("风险总惩罚", 0))
+    close = safe_float(row.get("现价", np.nan))
+    ma5 = safe_float(row.get("MA5", np.nan))
+    ma20 = safe_float(row.get("MA20", np.nan))
+    atr_pct = safe_float(row.get("ATR14%", np.nan))
+    day_pct = safe_float(row.get("日涨跌%", np.nan))
+    structure = safe_float(row.get("结构持续分", np.nan))
+    trigger = safe_float(row.get("触发分", np.nan))
+
+    flags = str(row.get("风险标签", ""))
+
+    # Hard disqualifiers first.
+    if "刷新20日低点" in flags or "近期低点持续下移" in flags:
+        risks.append("近期低点结构弱")
+    if "涨幅留存差" in flags:
+        risks.append("冲高留存差")
+    if weak_pen >= 12:
+        risks.append("弱势惩罚过高")
+    if math.isfinite(r20) and r20 < -5:
+        risks.append("20日趋势偏弱")
+    if math.isfinite(r5) and r5 < -4:
+        risks.append("5日趋势偏弱")
+    if math.isfinite(retention) and retention < 25:
+        risks.append("冲高保留率过低")
+    if failed >= 3:
+        risks.append("近期冲高失败过多")
+
+    # Trend / breakout quality.
+    if math.isfinite(r20):
+        if r20 >= 20:
+            score += 18; reasons.append("20日趋势很强")
+        elif r20 >= 8:
+            score += 12; reasons.append("20日趋势偏强")
+        elif r20 >= 0:
+            score += 5
+
+    if math.isfinite(close) and math.isfinite(ma5) and close >= ma5:
+        score += 8; reasons.append("站上MA5")
+    if math.isfinite(close) and math.isfinite(ma20) and close >= ma20:
+        score += 8; reasons.append("站上MA20")
+
+    if math.isfinite(from_h20):
+        if -2 <= from_h20 <= 1.5:
+            score += 15; reasons.append("接近/突破20日高点")
+        elif -5 <= from_h20 < -2:
+            score += 8
+
+    if math.isfinite(structure):
+        if structure >= 8:
+            score += 10; reasons.append("结构持续性好")
+        elif structure <= -5:
+            score -= 8; risks.append("结构持续性差")
+
+    if math.isfinite(trigger):
+        if trigger >= 14:
+            score += 10; reasons.append("已有转强触发")
+        elif trigger < 5:
+            score -= 4
+
+    if math.isfinite(retention):
+        if retention >= 70:
+            score += 14; reasons.append("冲高后涨幅留存优秀")
+        elif retention >= 50:
+            score += 8
+        elif retention < 30:
+            score -= 14
+
+    score -= min(12, failed * 4)
+
+    # Risk controls: don't chase uncontrolled acceleration.
+    if math.isfinite(day_pct):
+        if day_pct > 12:
+            score -= 14; risks.append("单日加速过猛")
+        elif day_pct > 8:
+            score -= 7
+        elif day_pct < -3:
+            score -= 6
+
+    if math.isfinite(atr_pct):
+        if atr_pct > 10:
+            score -= 10; risks.append("ATR波动过高")
+        elif atr_pct > 7:
+            score -= 5
+
+    hard_fail = (
+        "近期低点结构弱" in risks
+        or "冲高留存差" in risks
+        or weak_pen >= 12
+        or (math.isfinite(r20) and r20 < -5)
+        or (math.isfinite(retention) and retention < 25)
+        or failed >= 3
+    )
+
+    eligible = (score >= 45) and not hard_fail and risk_pen < 30
+    return round(score, 1), bool(eligible), "；".join(reasons[:4]) if reasons else "—", "；".join(risks[:4]) if risks else "—"
+
 def take_profit_targets(row, entry_price=None):
     """Dynamic informational profit-taking references, not a guarantee or order instruction."""
     current = safe_float(row.get("现价", np.nan))
@@ -1079,6 +1189,12 @@ def scan_all(codes):
             base.at[idx, "新闻判断"] = label
             base.at[idx, "综合分"] = float(np.clip(base.at[idx, "技术总分"] + ns, -50, 100))
     base["结论"] = base.apply(classify, axis=1)
+    bo = base.apply(lambda r: breakout_chase_score(r), axis=1)
+    base["追强分"] = [x[0] for x in bo]
+    base["追强资格"] = [x[1] for x in bo]
+    base["追强理由"] = [x[2] for x in bo]
+    base["追强风险"] = [x[3] for x in bo]
+
     # Only healthy/neutral candidates can receive affordability bonus. Weak names never get rescued by low price.
     good_mask = base["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
     base.loc[good_mask, "综合分"] = (base.loc[good_mask, "综合分"] + base.loc[good_mask, "资金友好分"]).clip(-50, 100)
@@ -1100,9 +1216,321 @@ def chart_for(code, raw_df, support=None):
     return fig
 
 
+
+# ---------- One-click historical backtest / similarity calibration ----------
+BT_FEATURES = [
+    "ret1","ret5","ret20","dist_high20","dist_low20",
+    "ma5_gap","ma20_gap","ma20_slope5","vol_ratio20",
+    "atr14_pct","retention10","failed_pop10","structure6"
+]
+BT_WEIGHTS = {
+    "ret1":0.7, "ret5":1.0, "ret20":1.15, "dist_high20":1.30, "dist_low20":0.75,
+    "ma5_gap":0.75, "ma20_gap":1.0, "ma20_slope5":1.05, "vol_ratio20":0.80,
+    "atr14_pct":1.0, "retention10":1.25, "failed_pop10":1.20, "structure6":1.10
+}
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def download_backtest_daily(codes_tuple):
+    """Two years of adjusted daily OHLCV for technical backtesting.
+    auto_adjust=True reduces split-related discontinuities in return features.
+    """
+    symbols = [ticker(c) for c in codes_tuple]
+    return yf.download(
+        tickers=symbols,
+        period="2y",
+        interval="1d",
+        auto_adjust=True,
+        group_by="ticker",
+        threads=True,
+        progress=False,
+        timeout=30,
+    )
+
+def _bt_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "Close" not in df.columns:
+        return pd.DataFrame()
+    d = df.copy().dropna(subset=["Close"])
+    for col in ["Open","High","Low","Volume"]:
+        if col not in d.columns:
+            d[col] = np.nan
+    c = d["Close"].astype(float)
+    h = d["High"].astype(float)
+    l = d["Low"].astype(float)
+    v = d["Volume"].astype(float).fillna(0)
+
+    f = pd.DataFrame(index=d.index)
+    f["ret1"] = c.pct_change() * 100
+    f["ret5"] = c.pct_change(5) * 100
+    f["ret20"] = c.pct_change(20) * 100
+
+    ma5 = c.rolling(5).mean()
+    ma20 = c.rolling(20).mean()
+    f["ma5_gap"] = (c / ma5 - 1) * 100
+    f["ma20_gap"] = (c / ma20 - 1) * 100
+    f["ma20_slope5"] = (ma20 / ma20.shift(5) - 1) * 100
+
+    h20 = h.rolling(20).max()
+    l20 = l.rolling(20).min()
+    f["dist_high20"] = (c / h20 - 1) * 100
+    f["dist_low20"] = (c / l20 - 1) * 100
+    f["vol_ratio20"] = v / v.rolling(20).mean().replace(0, np.nan)
+
+    prev_c = c.shift(1)
+    tr = pd.concat([(h-l).abs(), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
+    atr14 = tr.rolling(14).mean()
+    f["atr14_pct"] = atr14 / c * 100
+
+    # Rally retention: when intraday high rose >=2% versus prior close,
+    # measure how much of that excursion survived into the close.
+    excursion = (h / prev_c - 1) * 100
+    close_gain = (c / prev_c - 1) * 100
+    daily_retention = pd.Series(np.nan, index=d.index)
+    rally_mask = excursion >= 2.0
+    daily_retention.loc[rally_mask] = (close_gain.loc[rally_mask] / excursion.loc[rally_mask] * 100).clip(-100, 120)
+    f["retention10"] = daily_retention.rolling(10, min_periods=2).mean()
+
+    failed = ((excursion >= 2.0) & (daily_retention <= 15)).astype(float)
+    f["failed_pop10"] = failed.rolling(10, min_periods=5).sum()
+
+    # Compact price-structure feature: compare recent 3-bar highs/lows with prior 3 bars.
+    hi_recent = h.rolling(3).max()
+    lo_recent = l.rolling(3).min()
+    hi_prev = hi_recent.shift(3)
+    lo_prev = lo_recent.shift(3)
+    f["structure6"] = (
+        np.where((hi_recent > hi_prev) & (lo_recent > lo_prev), 1.0,
+        np.where((hi_recent < hi_prev) & (lo_recent < lo_prev), -1.0,
+        np.where(lo_recent > lo_prev, 0.35, np.where(lo_recent < lo_prev, -0.35, 0.0))))
+        * 10.0
+    )
+
+    # Future outcomes. These are labels only and are never used as current features.
+    f["next1_close"] = (c.shift(-1) / c - 1) * 100
+    f["next1_high"] = (h.shift(-1) / c - 1) * 100
+    f["next1_low"] = (l.shift(-1) / c - 1) * 100
+    future_high3 = pd.concat([h.shift(-1), h.shift(-2), h.shift(-3)], axis=1).max(axis=1)
+    future_low3 = pd.concat([l.shift(-1), l.shift(-2), l.shift(-3)], axis=1).min(axis=1)
+    f["next3_high"] = (future_high3 / c - 1) * 100
+    f["next3_low"] = (future_low3 / c - 1) * 100
+    f["next3_close"] = (c.shift(-3) / c - 1) * 100
+
+    # "Continuation" and "fake breakout" are deliberately symmetric risk labels.
+    f["continued3"] = ((f["next3_high"] >= 4.0) & (f["next3_close"] > 0)).astype(float)
+    f["fake3"] = ((f["next3_low"] <= -5.0) | (f["next3_close"] <= -3.0)).astype(float)
+    return f.replace([np.inf, -np.inf], np.nan)
+
+def build_backtest_cases(batch: pd.DataFrame, codes):
+    cases = []
+    for code in codes:
+        d = extract_one_daily(batch, code)
+        if d.empty:
+            continue
+        f = _bt_feature_frame(d)
+        if f.empty:
+            continue
+        f = f.copy()
+        f["代码"] = code
+        f["日期"] = f.index
+        # Need at least a basic 20-day structure and known future labels.
+        valid = f["next3_close"].notna() & f["ret5"].notna()
+        f = f.loc[valid]
+        if not f.empty:
+            cases.append(f.reset_index(drop=True))
+    if not cases:
+        return pd.DataFrame()
+    out = pd.concat(cases, ignore_index=True)
+    # Keep finite-ish rows with enough usable feature dimensions.
+    usable = out[BT_FEATURES].notna().sum(axis=1) >= 8
+    return out.loc[usable].reset_index(drop=True)
+
+def _robust_center_scale(cases: pd.DataFrame):
+    med = cases[BT_FEATURES].median()
+    q75 = cases[BT_FEATURES].quantile(0.75)
+    q25 = cases[BT_FEATURES].quantile(0.25)
+    scale = (q75 - q25) / 1.349
+    std = cases[BT_FEATURES].std()
+    scale = scale.where(scale > 1e-9, std)
+    scale = scale.where(scale > 1e-9, 1.0)
+    return med, scale
+
+def _similar_cases(cases, target, med, scale, code=None, peer=False, limit=120):
+    if cases is None or cases.empty:
+        return pd.DataFrame()
+    cols = [c for c in BT_FEATURES if c in target and math.isfinite(safe_float(target.get(c)))]
+    if len(cols) < 6:
+        return pd.DataFrame()
+
+    base = cases.copy()
+    if code is not None and not peer:
+        base = base[base["代码"] == code]
+    if base.empty:
+        return base
+
+    # Robust standardized weighted distance, using only dimensions available in each sample.
+    dist_num = pd.Series(0.0, index=base.index)
+    dist_den = pd.Series(0.0, index=base.index)
+    for c in cols:
+        zt = (safe_float(target[c]) - safe_float(med[c], 0)) / safe_float(scale[c], 1)
+        z = (base[c] - med[c]) / scale[c]
+        ok = z.notna()
+        w = BT_WEIGHTS.get(c, 1.0)
+        dist_num.loc[ok] += w * (z.loc[ok] - zt) ** 2
+        dist_den.loc[ok] += w
+    base = base.assign(_dims=(dist_den > 0).astype(int), _dist=np.sqrt(dist_num / dist_den.replace(0, np.nan)))
+    base = base[base["_dist"].notna()].sort_values("_dist")
+
+    if peer:
+        # Prevent one long-listed stock from dominating the peer sample.
+        base = base.groupby("代码", group_keys=False).head(5).sort_values("_dist")
+    return base.head(limit).copy()
+
+def _bt_stats(sample: pd.DataFrame):
+    if sample is None or sample.empty:
+        return None
+    s = sample.copy()
+    n = len(s)
+
+    # Small-sample shrinkage toward neutral rather than pretending 3 cases are certainty.
+    alpha = 5.0
+    p_up1 = ((s["next1_close"] > 0).sum() + alpha) / (n + 2*alpha)
+    p_cont = (s["continued3"].sum() + alpha) / (n + 2*alpha)
+    p_fake = (s["fake3"].sum() + alpha) / (n + 2*alpha)
+
+    def clipped_mean(col):
+        x = s[col].dropna()
+        if x.empty:
+            return np.nan
+        lo, hi = x.quantile(0.02), x.quantile(0.98)
+        return float(x.clip(lo, hi).mean())
+
+    return {
+        "n": n,
+        "p_up1": float(p_up1),
+        "p_cont3": float(p_cont),
+        "p_fake3": float(p_fake),
+        "next1_close_mean": clipped_mean("next1_close"),
+        "next1_high_med": safe_float(s["next1_high"].median()),
+        "next1_low_med": safe_float(s["next1_low"].median()),
+        "next3_high_med": safe_float(s["next3_high"].median()),
+        "next3_low_med": safe_float(s["next3_low"].median()),
+    }
+
+def _current_bt_target(df):
+    f = _bt_feature_frame(df)
+    if f.empty:
+        return {}
+    row = f.iloc[-1]
+    return {c: safe_float(row.get(c)) for c in BT_FEATURES}
+
+def calibrate_one(code, raw_df, cases, med, scale):
+    target = _current_bt_target(raw_df)
+    if not target:
+        return None
+    own = _similar_cases(cases, target, med, scale, code=code, peer=False, limit=45)
+    peers = _similar_cases(cases, target, med, scale, code=code, peer=True, limit=140)
+    own_s, peer_s = _bt_stats(own), _bt_stats(peers)
+    if peer_s is None:
+        return None
+
+    own_n = own_s["n"] if own_s else 0
+    # Long-lived stocks get up to 35% self-history weight; IPOs automatically rely on peers.
+    self_w = min(0.35, max(0.0, own_n / 60.0 * 0.35))
+    peer_w = 1.0 - self_w
+
+    def blend(k):
+        if own_s is None or not math.isfinite(safe_float(own_s.get(k))):
+            return safe_float(peer_s.get(k))
+        return self_w * safe_float(own_s[k]) + peer_w * safe_float(peer_s[k])
+
+    p_up = blend("p_up1")
+    p_cont = blend("p_cont3")
+    p_fake = blend("p_fake3")
+    n1c = blend("next1_close_mean")
+    n1h = blend("next1_high_med")
+    n1l = blend("next1_low_med")
+    n3h = blend("next3_high_med")
+    n3l = blend("next3_low_med")
+
+    raw_cal = (p_up - 0.50) * 28 + (p_cont - p_fake) * 26
+    if math.isfinite(n1c):
+        raw_cal += np.clip(n1c, -3, 3) * 1.2
+    cal = float(np.clip(raw_cal, -12, 12))
+
+    if peer_s["n"] >= 40 and p_fake >= 0.52 and p_cont <= 0.40:
+        status = "🔴 历史警戒"
+    elif peer_s["n"] >= 40 and p_fake >= 0.44:
+        status = "🟡 假突破风险偏高"
+    elif peer_s["n"] >= 40 and p_cont >= 0.52 and p_fake <= 0.32 and p_up >= 0.52:
+        status = "🟢 历史结构偏强"
+    else:
+        status = "⚪ 历史中性"
+
+    return {
+        "历史校准分": cal,
+        "历史状态": status,
+        "自身样本": own_n,
+        "相似样本": peer_s["n"],
+        "自身权重%": self_w * 100,
+        "次日上涨概率%": p_up * 100,
+        "3日延续概率%": p_cont * 100,
+        "3日假突破风险%": p_fake * 100,
+        "相似样本次日平均收盘%": n1c,
+        "相似样本次日高点中位%": n1h,
+        "相似样本次日低点中位%": n1l,
+        "相似样本3日高点中位%": n3h,
+        "相似样本3日低点中位%": n3l,
+    }
+
+def run_one_click_backtest(raw_map):
+    hist = download_backtest_daily(tuple(STOCK_CODES))
+    cases = build_backtest_cases(hist, STOCK_CODES)
+    if cases.empty:
+        return {}, 0
+    med, scale = _robust_center_scale(cases)
+    out = {}
+    for code in STOCK_CODES:
+        df = raw_map.get(code)
+        if df is None or df.empty:
+            # Use latest two-year history itself as current source if 4mo scan missed the name.
+            df = extract_one_daily(hist, code)
+        r = calibrate_one(code, df, cases, med, scale)
+        if r:
+            out[code] = r
+    return out, len(cases)
+
+def apply_backtest_calibration(rank: pd.DataFrame, bt_map: dict):
+    r = rank.copy()
+    defaults = {
+        "历史校准分":0.0, "历史状态":"未回测", "自身样本":0, "相似样本":0, "自身权重%":0.0,
+        "次日上涨概率%":np.nan, "3日延续概率%":np.nan, "3日假突破风险%":np.nan,
+        "相似样本次日平均收盘%":np.nan, "相似样本次日高点中位%":np.nan,
+        "相似样本次日低点中位%":np.nan, "相似样本3日高点中位%":np.nan,
+        "相似样本3日低点中位%":np.nan
+    }
+    for k,v in defaults.items():
+        r[k] = v
+
+    for idx,row in r.iterrows():
+        b = bt_map.get(str(row["代码"])) if bt_map else None
+        if not b:
+            continue
+        for k,v in b.items():
+            r.at[idx,k] = v
+
+    # Calibration is deliberately capped: history can tilt a decision, not overrule live price/news.
+    healthy = r["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
+    r.loc[healthy, "模式分"] = (r.loc[healthy, "模式分"] + r.loc[healthy, "历史校准分"]).clip(-50,100)
+    red = r["历史状态"].eq("🔴 历史警戒")
+    r.loc[red, "模式分"] = (r.loc[red, "模式分"] - 8).clip(-50,100)
+    if "追强资格" in r.columns:
+        r.loc[red, "追强资格"] = False
+    r["综合分"] = r["模式分"]
+    return r.sort_values(["模式分","回调质量分","背景分","触发分","一手资金"], ascending=[False,False,False,False,True]).reset_index(drop=True)
+
+
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V11")
-st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 免费行情可能延迟")
+st.title("🎲 四时段强势回踩资金友好大师 V14")
+st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 免费行情可能延迟")
 
 with st.expander("先看核心纪律（网站会强制执行）", expanded=True):
     for x in RULES:
@@ -1125,6 +1553,12 @@ if "raw" not in st.session_state:
     st.session_state.raw = None
 if "news" not in st.session_state:
     st.session_state.news = None
+if "bt_map" not in st.session_state:
+    st.session_state.bt_map = None
+if "bt_case_count" not in st.session_state:
+    st.session_state.bt_case_count = 0
+if "bt_time" not in st.session_state:
+    st.session_state.bt_time = None
 
 st.markdown("### 🕒 分析时段")
 mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘前大引不成", "收盘后预测明天"], horizontal=True)
@@ -1134,7 +1568,7 @@ st.markdown("### 💴 资金偏好")
 budget = st.slider("单只股票最多愿意占用多少一手资金？", 100000, 1000000, 300000, 50000, format="¥%d")
 st.caption("这里只影响合格候选之间的排序。便宜不会救活弱票；真正抓行情仍按股票代码进行。")
 
-left, right = st.columns([1, 2])
+left, middle, right = st.columns([1, 1.25, 1.75])
 with left:
     if st.button("🚀 扫描 72 只股票", type="primary", use_container_width=True):
         with st.spinner("正在拉取行情、计算趋势，并对前排候选精查新闻…"):
@@ -1146,8 +1580,28 @@ with left:
             st.session_state.raw = raw
             st.session_state.news = news
             st.session_state.scan_mode = mode
+            # New scan invalidates old calibration because the current feature point changed.
+            st.session_state.bt_map = None
+            st.session_state.bt_case_count = 0
+            st.session_state.bt_time = None
+with middle:
+    if st.button("🧪 一键回测 + 自动校准", use_container_width=True):
+        with st.spinner("正在自动建立历史样本、寻找相似结构并做无未来泄漏校准…"):
+            if st.session_state.scan is None:
+                rank0, raw0, news0 = scan_all(STOCK_CODES)
+                if mode in ["盘中", "收盘前大引不成"]:
+                    intra0 = download_intraday(tuple(STOCK_CODES))
+                    rank0 = apply_intraday_features(rank0, intra0)
+                st.session_state.scan = rank0
+                st.session_state.raw = raw0
+                st.session_state.news = news0
+                st.session_state.scan_mode = mode
+            bt_map, bt_n = run_one_click_backtest(st.session_state.raw or {})
+            st.session_state.bt_map = bt_map
+            st.session_state.bt_case_count = bt_n
+            st.session_state.bt_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
 with right:
-    st.caption(f"当前模式：{mode}。先过弱势/破位硬门槛，再按该时段的权重排序；便宜只在合格候选之间加分。")
+    st.caption(f"当前模式：{mode}。回测按钮会自动处理个股自身历史 + 全股票池相似结构，不需要你选参数。历史结果只做有限校准，不会盖过实时走势和新闻。")
 
 rank = st.session_state.scan
 raw_map = st.session_state.raw or {}
@@ -1160,7 +1614,10 @@ if rank is not None and not rank.empty:
         intra = download_intraday(tuple(STOCK_CODES))
         rank = apply_intraday_features(rank, intra)
     rank = mode_score(rank, mode, budget)
-    rank["综合分"] = rank["模式分"]  # backward-compatible display name
+    if st.session_state.bt_map:
+        rank = apply_backtest_calibration(rank, st.session_state.bt_map)
+    else:
+        rank["综合分"] = rank["模式分"]  # backward-compatible display name
     heading = {"开盘前":"今天开盘前优先盯谁", "盘中":"盘中现在优先看谁", "收盘前大引不成":"收盘前大引不成优先候选", "收盘后预测明天":"明天优先观察谁"}[mode]
     st.subheader(heading)
     top = rank.iloc[0].copy()
@@ -1174,6 +1631,21 @@ if rank is not None and not rank.empty:
     c4.metric("一手资金", f"¥{top['一手资金']:,.0f}" if math.isfinite(top['一手资金']) else "—")
     c5.metric("结论", top["结论"])
     st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
+
+    if st.session_state.bt_map:
+        st.markdown("#### 🧪 一键历史回测校准")
+        b1,b2,b3,b4,b5,b6 = st.columns(6)
+        b1.metric("历史状态", str(top.get("历史状态","—")))
+        b2.metric("次日上涨", f"{format_num(top.get('次日上涨概率%'))}%")
+        b3.metric("3日延续", f"{format_num(top.get('3日延续概率%'))}%")
+        b4.metric("假突破风险", f"{format_num(top.get('3日假突破风险%'))}%")
+        b5.metric("相似样本", f"{int(top.get('相似样本',0))}")
+        b6.metric("历史校准", f"{format_num(top.get('历史校准分'),1)}")
+        st.caption(
+            f"历史样本总数约 {st.session_state.bt_case_count:,} 条；"
+            f"个股自身样本 {int(top.get('自身样本',0))} 条，自身权重 {format_num(top.get('自身权重%'),1)}%。"
+            f" 新股自身样本不足时会自动更多依赖相似股票，不需要手动设置。"
+        )
 
     if mode == "收盘前大引不成":
         st.markdown("#### 🌙 大引不成隔夜资格")
@@ -1191,9 +1663,24 @@ if rank is not None and not rank.empty:
             mc5.metric("涨幅留存", f"{format_num(best_moc['日内涨幅保留率%'])}%")
             st.caption("思路：先挂你愿意接的低价限价；若盘中未成交，再由‘不成’在收盘集合竞价转为市价。这里只筛隔夜质量，不保证次日高开。免费5分钟行情可能延迟，收盘前务必再看券商盘口。")
 
+
+    st.markdown("#### 🚀 强势突破追强通道")
+    st.caption("默认仍优先健康回调；但真正的强趋势股如果接近/突破近期高点、冲高留存好且风险不过高，也允许追强。弱票突然暴拉不会被当成真突破。")
+    if "追强资格" in rank.columns:
+        breakout_pool = rank[rank["追强资格"] == True].copy()
+        if breakout_pool.empty:
+            st.caption("今天没有股票通过『强势突破追强』风险门槛。宁可不追，也不把弱票突然暴拉当成主升突破。")
+        else:
+            breakout_pool = breakout_pool.sort_values(["追强分","综合分"], ascending=False).head(8)
+            st.dataframe(
+                breakout_pool[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距20日高%","追强分","近10日冲高保留率%","冲高失败次数","弱势惩罚","追强理由","追强风险"]].round(2),
+                use_container_width=True,
+                hide_index=True
+            )
+
     # Fun layer: rules first, randomness second. Weak/broken names are never admitted to the draw.
     st.markdown("#### 🎲 大师点兵：先过纪律，再交给一点运气")
-    eligible = rank[(rank["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])) & (rank["风险总惩罚"] < 18)].copy()
+    eligible = rank[(rank["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])) & (rank["风险总惩罚"] < 18) & (~rank.get("历史状态", pd.Series("未回测", index=rank.index)).eq("🔴 历史警戒"))].copy()
     if eligible.empty:
         st.caption("今天没有足够合格的票，大师拒绝硬抽。")
     else:
@@ -1219,7 +1706,7 @@ if rank is not None and not rank.empty:
         st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","回调质量分","上方空间/支撑风险比","背景分","触发分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### 排名表")
-    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","新闻判断","风险标签"]
+    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","追强资格","追强分","追强理由","追强风险","历史状态","历史校准分","次日上涨概率%","3日延续概率%","3日假突破风险%","相似样本","自身样本","新闻判断","风险标签"]
     if mode in ["盘中", "收盘前大引不成"]:
         extras = ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]
         if mode == "收盘前大引不成":
@@ -1228,7 +1715,7 @@ if rank is not None and not rank.empty:
             if extra in rank.columns:
                 show_cols.insert(6, extra)
     display_df = rank[show_cols].copy()
-    num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","新闻判断","风险标签"]]
+    num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","历史状态","新闻判断","风险标签","追强理由","追强风险"]]
     display_df[num_cols] = display_df[num_cols].round(2)
     st.dataframe(display_df, use_container_width=True, hide_index=True, height=620)
 
@@ -1245,8 +1732,11 @@ if rank is not None and not rank.empty:
             q_ns, q_news_label, q_items = force_news_check(str(best["代码"]))
             best["新闻分"] = q_ns
             best["新闻判断"] = q_news_label
-            if "追" in q and math.isfinite(best["日涨跌%"] or np.nan) and best["日涨跌%"] >= 6:
-                st.error(f"{best['代码']} 今天已经明显拉升。按你的纪律：**不追突然暴拉**。等回踩守住关键位、再度转强再看。")
+            if "追" in q and math.isfinite(safe_float(best.get("日涨跌%"))) and safe_float(best.get("日涨跌%")) >= 6:
+                if bool(best.get("追强资格", False)) and str(best.get("历史状态","")) != "🔴 历史警戒":
+                    st.success(f"{stock_label(str(best['代码']))} 属于可评估的**强势突破追强**候选：不是因为涨得多就放行，而是趋势/留存/风险门槛已通过。")
+                else:
+                    st.error(f"{stock_label(str(best['代码']))} 虽然暴拉，但没有通过追强风险门槛；这种更接近需要防范的弱势反弹/假突破，不建议因为怕踏空硬追。")
             else:
                 st.success(f"当前规则下更优的是 **{stock_label(str(best['代码']))}**（综合分 {best['综合分']:.1f}，结论：{best['结论']}）。")
                 st.write(
@@ -1279,6 +1769,23 @@ if rank is not None and not rank.empty:
     m5.metric("ATR14", f"{format_num(row['ATR14%'])}%")
     m6.metric("综合分", format_num(row["综合分"]))
     st.write(f"**结论：{row['结论']}**｜{row['风险标签']}｜{row['新闻判断']}")
+
+    if st.session_state.bt_map and str(selected) in st.session_state.bt_map:
+        br = st.session_state.bt_map[str(selected)]
+        st.markdown("#### 🧪 这只股票的历史相似结构")
+        h1,h2,h3,h4,h5 = st.columns(5)
+        h1.metric("历史状态", br["历史状态"])
+        h2.metric("次日上涨", f"{br['次日上涨概率%']:.1f}%")
+        h3.metric("3日延续", f"{br['3日延续概率%']:.1f}%")
+        h4.metric("假突破风险", f"{br['3日假突破风险%']:.1f}%")
+        h5.metric("相似样本", f"{br['相似样本']}")
+        st.caption(
+            f"个股自身相似样本 {br['自身样本']} 条（自动权重 {br['自身权重%']:.1f}%）；"
+            f"相似样本次日高点中位 {format_num(br['相似样本次日高点中位%'])}% / "
+            f"次日低点中位 {format_num(br['相似样本次日低点中位%'])}% / "
+            f"3日高点中位 {format_num(br['相似样本3日高点中位%'])}% / "
+            f"3日低点中位 {format_num(br['相似样本3日低点中位%'])}%。"
+        )
     if "历史完整度" in row.index and row["历史完整度"] != "完整":
         st.warning(f"⚠️ {row['历史完整度']}：MA20、20日涨幅等长周期指标可能不可用或参考价值较低；系统不会因此把这只新股从股票池删除。")
     p1,p2,p3 = st.columns(3)
@@ -1344,6 +1851,8 @@ with st.expander("评分怎么判"):
 **12. 大师点兵**：先把明显弱票排掉，再在前排合格候选中加权随机。随机承认短线的不确定性，但不替代纪律。  
 **13. 盘中短周期结构**：只使用实际抓到的 5 分钟 OHLCV 计算。增加 5分钟MA20（约100分钟均价）、MA20短期斜率，以及最近6根5分钟K线的高点/低点是否抬高。价格在上行MA20附近、且高低点同步抬高加分；跌破下行MA20、且高低点同步下移扣分。数据取不到就显示为空，不补猜。  
 **14. 收盘前大引不成**：只在尾盘结构健康时考虑隔夜。优先“强背景 + 价格在日内高位区但没有失控加速 + 最后30分钟不跳水 + 站在VWAP上方 + 5分钟结构不弱 + 尾盘量能温和增强 + 涨幅留存较高”的股票；尾盘突然直线拉升、离VWAP过远、当天涨幅过大或冲高回落明显则扣分。
+
+**15. 一键历史回测/相似结构校准**：自动抓取股票池约2年日线，用每个历史时点“当时已经能看到的数据”生成样本，再统计之后1天/3天结果，避免未来数据泄漏。程序同时找“这只股票自身过去的相似形态”和“整个股票池里的相似形态”；老股票自身样本充足时最多占35%，新股样本少时自动更多依赖相似股票。小样本概率会向中性收缩，不把3次历史当成100%规律。历史校准最多只加减有限分数；若相似样本显示假突破风险明显偏高，会取消追强资格，但不会覆盖实时新闻和实时价格结构。
 """)
 
 st.caption("数据说明：Yahoo Finance/yfinance 为免费公开数据入口，不是东京证券交易所官方低延迟行情。资金友好度按100股一手估算，仅作排序辅助。新闻来自 Google News RSS。东证通常制限值幅规则按 JPX 公布表计算；连续封板等特殊扩大情形不由免费行情自动识别。")
