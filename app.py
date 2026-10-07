@@ -17,7 +17,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 import json
 
-st.set_page_config(page_title="四时段强势回踩大师 V20.4", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V20.5", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -285,7 +285,7 @@ def reward_risk_proxy(from_h20, support_gap, pullback_quality):
 def affordability_score(price, budget=300000):
     """Capital friendliness for a standard 100-share cash lot.
 
-    V20.4: moderately stronger than before and relative to the user's actual budget.
+    V20.5: moderately stronger than before and relative to the user's actual budget.
     Cheapness can separate otherwise comparable candidates, but never rescues a weak stock.
     Maximum bonus is 14 points.
     """
@@ -1095,28 +1095,66 @@ def fetch_news(code: str, max_items=6):
         return []
 
 
+def _news_age_days(pub_date):
+    try:
+        ts = pd.to_datetime(pub_date, utc=True)
+        if pd.isna(ts):
+            return np.nan
+        now = pd.Timestamp.now(tz="UTC")
+        return max(0.0, float((now - ts).total_seconds() / 86400.0))
+    except Exception:
+        return np.nan
+
 def score_news(items):
+    """Fresh news can move the score; old news is only disclosed, not treated as a new catalyst."""
     if not items:
         return 0, "未抓到近期公开新闻"
-    score = 0
-    pos_hits, neg_hits = [], []
+
+    score = 0.0
+    recent_pos, recent_neg, old_pos, old_neg = [], [], [], []
     for it in items:
-        t = it["title"]
+        title = it.get("title", "")
+        age = _news_age_days(it.get("pubDate", ""))
+
+        # Freshness weighting: full <=7d, reduced 8-30d, disclosure-only >30d.
+        if math.isfinite(age):
+            if age <= 7:
+                w = 1.0
+            elif age <= 30:
+                w = 0.35
+            else:
+                w = 0.0
+        else:
+            # Unknown date: do not let it become a strong catalyst.
+            w = 0.20
+
         for kw in POSITIVE_KW:
-            if kw in t:
-                score += 2.5
-                pos_hits.append(kw)
+            if kw in title:
+                if w > 0:
+                    score += 2.5 * w
+                    recent_pos.append(kw)
+                else:
+                    old_pos.append(kw)
         for kw in NEGATIVE_KW:
-            if kw in t:
-                score -= 4
-                neg_hits.append(kw)
+            if kw in title:
+                if w > 0:
+                    score -= 4.0 * w
+                    recent_neg.append(kw)
+                else:
+                    old_neg.append(kw)
+
     score = float(np.clip(score, -15, 15))
-    if pos_hits and not neg_hits:
-        label = "有潜在正面催化词：" + "、".join(sorted(set(pos_hits))[:5])
-    elif neg_hits:
-        label = "存在风险新闻词：" + "、".join(sorted(set(neg_hits))[:5])
+
+    if recent_neg:
+        label = "存在近期风险新闻词：" + "、".join(sorted(set(recent_neg))[:5])
+    elif recent_pos:
+        label = "有近期潜在正面催化词：" + "、".join(sorted(set(recent_pos))[:5])
+    elif old_neg:
+        label = "旧闻风险词（>30日，仅提示不计分）：" + "、".join(sorted(set(old_neg))[:5])
+    elif old_pos:
+        label = "旧闻正面词（>30日，仅提示不计分）：" + "、".join(sorted(set(old_pos))[:5])
     else:
-        label = "有新闻，但未识别到明确催化/风险关键词"
+        label = "有新闻，但未识别到明确且新鲜的催化/风险关键词"
     return score, label
 
 
@@ -1128,12 +1166,16 @@ def force_news_check(code: str):
     if not items:
         return 0.0, "新闻获取失败或未找到近期匹配新闻", []
     ns, label = score_news(items)
-    if label.startswith("有潜在正面催化词"):
-        display = "已检索｜潜在正面催化｜" + label.split("：", 1)[-1]
-    elif label.startswith("存在风险新闻词"):
-        display = "已检索｜风险新闻｜" + label.split("：", 1)[-1]
+    if label.startswith("有近期潜在正面催化词"):
+        display = "已检索｜近期正面催化｜" + label.split("：", 1)[-1]
+    elif label.startswith("存在近期风险新闻词"):
+        display = "已检索｜近期风险新闻｜" + label.split("：", 1)[-1]
+    elif label.startswith("旧闻风险词"):
+        display = "已检索｜旧风险新闻（仅提示，不计新催化）｜" + label.split("：", 1)[-1]
+    elif label.startswith("旧闻正面词"):
+        display = "已检索｜旧正面新闻（仅提示，不计新催化）｜" + label.split("：", 1)[-1]
     else:
-        display = "已检索｜无明显催化/风险关键词"
+        display = "已检索｜无明显且新鲜的催化/风险关键词"
     return float(ns), display, items
 
 
@@ -1202,7 +1244,7 @@ def scan_all(codes, budget=300000):
             ns, label, _items = news_map[c]
             base.at[idx, "新闻分"] = ns
             base.at[idx, "新闻判断"] = label
-            base.at[idx, "综合分"] = float(np.clip(base.at[idx, "技术总分"] + ns, -50, 100))
+            base.at[idx, "综合排名分"] = float(np.clip(base.at[idx, "技术总分"] + ns, -50, 100))
     base["结论"] = base.apply(classify, axis=1)
     bo = base.apply(lambda r: breakout_chase_score(r), axis=1)
     base["追强分"] = [x[0] for x in bo]
@@ -1212,7 +1254,7 @@ def scan_all(codes, budget=300000):
 
     # Only healthy/neutral candidates can receive the affordability bonus. Weak names never get rescued by low price.
     good_mask = base["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
-    base.loc[good_mask, "综合分"] = (base.loc[good_mask, "综合分"] + base.loc[good_mask, "资金友好分"]).clip(-50, 100)
+    base.loc[good_mask, "综合排名分"] = (base.loc[good_mask, "综合排名分"] + base.loc[good_mask, "资金友好分"]).clip(-50, 100)
     base = base.sort_values(["综合分", "背景分", "触发分", "一手资金"], ascending=[False, False, False, True]).reset_index(drop=True)
     return base, raw, news_map
 
@@ -1543,6 +1585,24 @@ def apply_backtest_calibration(rank: pd.DataFrame, bt_map: dict):
     return r.sort_values(["模式分","回调质量分","背景分","触发分","一手资金"], ascending=[False,False,False,False,True]).reset_index(drop=True)
 
 
+
+
+
+def historical_confidence_label(row):
+    """Describe evidence strength, not prediction certainty."""
+    p_up = safe_float(row.get("次日上涨概率%"))
+    p_cont = safe_float(row.get("3日延续概率%"))
+    p_fake = safe_float(row.get("3日假突破风险%"))
+    n = safe_float(row.get("相似样本"))
+    if not all(math.isfinite(x) for x in [p_up, p_cont, p_fake, n]):
+        return "⚪ 未充分回测"
+    if n >= 100 and p_up >= 57 and p_cont >= 50 and p_fake <= 34:
+        return "🟢 历史证据较强"
+    if n >= 80 and p_up >= 53 and p_cont >= 45 and p_fake <= 42:
+        return "🟡 历史证据中等"
+    if n >= 60 and p_fake >= 48:
+        return "🔴 历史证据偏差"
+    return "⚪ 历史证据中性"
 
 
 # ---------- Automatic Night PTS ingestion ----------
@@ -2193,8 +2253,8 @@ def apply_global_catalysts(rank: pd.DataFrame, catalyst_map: dict, mode: str):
 
 
 
-# ---------- V20.4: frozen Top5 predictions / pullback plans / optional persistent memory ----------
-MODEL_VERSION = "V20.4.1"
+# ---------- V20.5: frozen Top5 predictions / pullback plans / optional persistent memory ----------
+MODEL_VERSION = "V20.5.1"
 
 def prediction_validation_rule(mode: str) -> str:
     return {
@@ -2205,14 +2265,17 @@ def prediction_validation_rule(mode: str) -> str:
     }.get(mode, "按下一交易阶段验证")
 
 def pullback_buy_plan(row):
-    """Create a pre-committed pullback zone using only information already visible now.
-    This is especially useful for true breakout names that are strong but too extended to chase blindly.
+    """Pre-committed buy zone with TWO risk levels:
+    short-term alert for trading decisions, structural invalidation for the larger setup.
     """
     current = safe_float(row.get("盘中现价", np.nan))
     if not math.isfinite(current):
         current = safe_float(row.get("现价", np.nan))
     if not math.isfinite(current) or current <= 0:
-        return {"类型":"无数据","回踩下沿":np.nan,"回踩上沿":np.nan,"回踩中心":np.nan,"失效位":np.nan,"说明":"—"}
+        return {
+            "类型":"无数据","回踩下沿":np.nan,"回踩上沿":np.nan,"回踩中心":np.nan,
+            "短线警戒位":np.nan,"结构失效位":np.nan,"失效位":np.nan,"说明":"—"
+        }
 
     atr_pct = safe_float(row.get("ATR14%", np.nan))
     atr_abs = current * atr_pct / 100.0 if math.isfinite(atr_pct) and atr_pct > 0 else current * 0.035
@@ -2231,14 +2294,12 @@ def pullback_buy_plan(row):
         math.isfinite(dayp) and dayp >= 6 and math.isfinite(bg) and bg >= 25
     )
 
-    # Candidate structural anchors already below price.
     anchors = []
     for name, v in [("MA5", ma5), ("关键支撑", support), ("MA20", ma20)]:
         if math.isfinite(v) and current * 0.82 <= v < current * 0.998:
             anchors.append((name, v))
 
     if is_breakout:
-        # Do not require a strong stock to become "cheap"; target a normal 0.25~0.70 ATR digestion.
         floor = current - 0.70 * atr_abs
         ceiling = current - 0.25 * atr_abs
         structural = max([v for _,v in anchors], default=current - 0.45 * atr_abs)
@@ -2246,34 +2307,42 @@ def pullback_buy_plan(row):
         low = center - 0.12 * atr_abs
         high = center + 0.12 * atr_abs
         plan_type = "强势突破回踩"
-        note = "真突破/高位强势票：不因价格高自动否决，优先等正常回踩而不是盲目追最高点"
+        note = "真突破/高位强势票：允许高位参与，但优先等正常回踩；进入区间后还要看承接，不能机械挂单。"
+        short_alert = low - 0.30 * atr_abs
     else:
-        # For normal pullback candidates, lean closer to support/short MA.
         structural = max([v for _,v in anchors], default=current - 0.30 * atr_abs)
         center = min(current - 0.10 * atr_abs, max(current - 0.55 * atr_abs, structural))
         low = center - 0.10 * atr_abs
         high = center + 0.10 * atr_abs
         plan_type = "回调埋伏" if math.isfinite(pull) and pull >= 10 else "观察回踩"
-        note = "普通候选：回踩区间只作预先计划，不能等跌破结构后再改口说是低吸"
+        note = "普通候选：进入回踩区后观察承接；若直接贯穿短线警戒位且反弹弱，取消买入，不等大结构彻底破坏。"
+        short_alert = low - 0.25 * atr_abs
 
     if math.isfinite(support):
         low = max(low, support * 0.995)
-        # Invalidation is intentionally below the support visible at prediction time.
-        invalid = support - 0.22 * atr_abs
+        structural_invalid = support - 0.22 * atr_abs
     else:
-        invalid = center - 0.85 * atr_abs
+        structural_invalid = center - 0.85 * atr_abs
 
-    # Keep zone logical and below current.
     high = min(high, current * 0.997)
     low = min(low, high)
     center = (low + high) / 2.0
+
+    # Keep the short alert meaningfully below the buy zone but above deep structural invalidation.
+    short_alert = min(short_alert, low - 0.10 * atr_abs)
+    if math.isfinite(structural_invalid):
+        short_alert = max(short_alert, structural_invalid + 0.25 * atr_abs)
+    short_alert = min(short_alert, low * 0.998)
 
     return {
         "类型":plan_type,
         "回踩下沿":float(low),
         "回踩上沿":float(high),
         "回踩中心":float(center),
-        "失效位":float(invalid),
+        "短线警戒位":float(short_alert),
+        "结构失效位":float(structural_invalid),
+        # backward compatibility for existing CSV verifier
+        "失效位":float(structural_invalid),
         "说明":note,
     }
 
@@ -2334,11 +2403,14 @@ def build_top5_snapshot(rank: pd.DataFrame, mode: str, run_id: str, analysis_tim
             "海外催化": str(r.get("海外催化状态","")),
             "历史状态": str(r.get("历史状态","")),
             "买入计划类型": pb["类型"],
-            "买入动作": buy_action_from_plan(r)["动作"],
+            "买入动作": buy_action_from_plan(r, mode)["动作"],
             "回踩买入下沿": pb["回踩下沿"],
             "回踩买入上沿": pb["回踩上沿"],
             "回踩买入中心": pb["回踩中心"],
+            "短线警戒位": pb["短线警戒位"],
+            "结构失效位": pb["结构失效位"],
             "失效位": pb["失效位"],
+            "历史置信度": historical_confidence_label(r),
             "第一止盈": safe_float(tp.get("第一止盈")),
             "强势目标": safe_float(tp.get("强势续抱目标")),
             "冻结指标JSON": json.dumps(frozen, ensure_ascii=False, allow_nan=False) if all(
@@ -2433,7 +2505,7 @@ def load_recent_predictions_supabase(limit=100):
 
 
 
-# ---------- V20.4: upload yesterday's frozen CSV and grade it automatically ----------
+# ---------- V20.5: upload yesterday's frozen CSV and grade it automatically ----------
 def _parse_jst_time(s):
     try:
         s = str(s).replace(" JST","")
@@ -2609,6 +2681,19 @@ def grade_prediction_row(r):
     if math.isfinite(low) and low > 0 and math.isfinite(close):
         rebound = (close / low - 1) * 100
 
+    if invalid_hit and not tp1_hit:
+        cause = "支撑/结构判断失败"
+    elif buy_touch and math.isfinite(close_ret) and close_ret < 0 and not tp1_hit:
+        cause = "回踩区承接不足"
+    elif (not buy_touch) and math.isfinite(close_ret) and close_ret >= 2:
+        cause = "买入区设得过低，错过上涨"
+    elif tp1_hit and math.isfinite(close_ret) and close_ret < 0:
+        cause = "冲高回落；止盈纪律有价值"
+    elif (not tp1_hit) and math.isfinite(max_up) and max_up > 1.5:
+        cause = "方向尚可，但第一止盈可能偏远"
+    else:
+        cause = "暂无明确单一原因"
+
     return {
         "验证状态":"已验证",
         "验证日期":str(eval_date),
@@ -2625,7 +2710,8 @@ def grade_prediction_row(r):
         "失效位触及":bool(invalid_hit),
         "低点后收盘反弹%":rebound,
         "判卷结果":result,
-        "验证说明":"按冻结预测参数自动判卷",
+        "自动纠因标签":cause,
+        "验证说明":"按冻结预测参数自动判卷；网站只记录/归因，不会自行修改程序规则",
     }
 
 def verify_prediction_csv(uploaded_file):
@@ -2638,7 +2724,7 @@ def verify_prediction_csv(uploaded_file):
     required = ["预测时间","模式","排名","代码","预测价格","第一止盈","强势目标","失效位"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        return None, "不是V20/V20.4预测CSV，缺少：" + "、".join(missing)
+        return None, "不是V20/V20.5预测CSV，缺少：" + "、".join(missing)
 
     results = []
     for _, row in df.iterrows():
@@ -2649,32 +2735,50 @@ def verify_prediction_csv(uploaded_file):
 
 
 
-def buy_action_from_plan(row):
+def buy_action_from_plan(row, mode=None):
     pb = pullback_buy_plan(row)
-    current = safe_float(row.get("盘中现价", np.nan))
-    if not math.isfinite(current):
-        current = safe_float(row.get("现价", np.nan))
+    tse_close = safe_float(row.get("现价", np.nan))
+    intraday = safe_float(row.get("盘中现价", np.nan))
+    pts = safe_float(row.get("PTS价格", np.nan))
+    pts_conf = safe_float(row.get("PTS可信度%", np.nan))
+    pts_status = str(row.get("PTS状态", ""))
+
+    current = intraday if math.isfinite(intraday) else tse_close
+    ref_source = "东证现价/收盘"
+
+    # For next-session decisions, a valid PTS quote is fresher than TSE close.
+    if mode in ["开盘前", "收盘后预测明天"] and math.isfinite(pts) and "过期" not in pts_status:
+        current = pts
+        ref_source = "夜间PTS"
+
     lo = safe_float(pb.get("回踩下沿"))
     hi = safe_float(pb.get("回踩上沿"))
+    alert = safe_float(pb.get("短线警戒位"))
 
     if not math.isfinite(current) or not math.isfinite(lo) or not math.isfinite(hi):
         action = "数据不足"
+    elif math.isfinite(alert) and current < alert:
+        action = "⚠️ 已跌破短线警戒位，先取消机械低吸"
     elif lo <= current <= hi:
-        action = "✅ 当前就在买入区间"
+        action = "✅ 已进入买入观察区，先看承接再下单"
     elif current > hi:
         action = "⏳ 等回踩到买入区间"
     else:
-        action = "⚠️ 已跌破计划买入区，先别急着接"
+        action = "⚠️ 已跌破原买入区，先看能否重新收回"
 
     return {
         **pb,
-        "当前价": current,
+        "当前参考价": current,
+        "参考价来源": ref_source,
+        "东证价": tse_close,
+        "PTS价": pts,
+        "PTS可信度%": pts_conf,
         "动作": action,
     }
 
 
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V20.4")
+st.title("🎲 四时段强势回踩资金友好大师 V20.5")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -2733,6 +2837,64 @@ st.info(MODE_DESCRIPTIONS[mode])
 st.markdown("### 💴 资金偏好")
 budget = st.slider("单只股票最多愿意占用多少一手资金？", 100000, 1000000, 300000, 50000, format="¥%d")
 st.caption("资金权重已提高到中等：质量接近时，100股占用资金更少的票会明显占优；但便宜不会救活弱票。")
+
+st.markdown("### 📊 预测判卷")
+with st.expander("📊 昨日/历史预测判卷（把CSV拖这里）", expanded=True):
+    st.markdown("""
+**这里就是上传入口。** 今天下载网站生成的 `prediction_....csv`。  
+到了验证日，把文件**直接拖到下面的框里**，然后点“开始判卷”。网站会自己抓实际行情，不用手填。
+""")
+    uploaded_pred = st.file_uploader(
+        "把之前下载的 prediction_....csv 拖到这里",
+        type=["csv"],
+        key="prediction_verify_upload",
+        accept_multiple_files=False,
+    )
+    if uploaded_pred is not None:
+        st.caption(f"已载入：{uploaded_pred.name}")
+        if st.button("📊 开始判卷", use_container_width=True, key="verify_prediction_btn"):
+            with st.spinner("正在抓实际行情并对照冻结预测…"):
+                verified_df, verify_err = verify_prediction_csv(uploaded_pred)
+            if verify_err:
+                st.error(verify_err)
+            elif verified_df is not None:
+                st.session_state["verified_prediction_df"] = verified_df
+
+    verified_df = st.session_state.get("verified_prediction_df")
+    if verified_df is not None and not verified_df.empty:
+        show_cols = [c for c in [
+            "排名","代码","日文名","中文名","模式","预测时间","预测价格",
+            "回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
+            "验证日期","实际开盘","实际最高","实际最低","实际收盘",
+            "最大浮盈%","最大浮亏%","收盘收益%","回踩买入区间触及",
+            "第一止盈命中","强势目标命中","失效位触及","低点后收盘反弹%","判卷结果","自动纠因标签"
+        ] if c in verified_df.columns]
+        view = verified_df[show_cols].copy()
+        for c in ["预测价格","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
+                  "实际开盘","实际最高","实际最低","实际收盘",
+                  "最大浮盈%","最大浮亏%","收盘收益%","低点后收盘反弹%"]:
+            if c in view.columns:
+                view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+        ok_count = verified_df["判卷结果"].astype(str).str.startswith("✅").sum() if "判卷结果" in verified_df.columns else 0
+        fail_count = verified_df["判卷结果"].astype(str).str.startswith("❌").sum() if "判卷结果" in verified_df.columns else 0
+        neutral_count = verified_df["判卷结果"].astype(str).str.startswith("🟡").sum() if "判卷结果" in verified_df.columns else 0
+        c1,c2,c3 = st.columns(3)
+        c1.metric("成功", int(ok_count))
+        c2.metric("一般/混乱", int(neutral_count))
+        c3.metric("失败", int(fail_count))
+
+        st.download_button(
+            "💾 下载判卷后的CSV",
+            data=verified_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="verified_predictions.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+st.caption("判卷会记录战绩和自动纠因标签，但不会自行改写模型规则；把判卷CSV给ChatGPT后再据此改程序，避免少量样本把模型带歪。")
 
 
 if st.button("🧠 全自动分析", type="primary", use_container_width=True):
@@ -2827,17 +2989,17 @@ if rank is not None and not rank.empty:
 
     if final_grade.startswith("A"):
         st.success(
-            f"**首选：{final_label}**｜{final_grade}｜综合分 {safe_float(top.get('综合分')):.1f}\n\n"
+            f"**首选：{final_label}**｜{final_grade}｜综合排名分 {safe_float(top.get('综合排名分')):.1f}\n\n"
             f"历史：{hist_state}｜新闻：{news_state}｜海外：{str(top.get('海外催化状态','—'))}｜风险：{risk_label}"
         )
     elif final_grade.startswith("B+"):
         st.warning(
-            f"**优先观察：{final_label}**｜{final_grade}｜综合分 {safe_float(top.get('综合分')):.1f}\n\n"
+            f"**优先观察：{final_label}**｜{final_grade}｜综合排名分 {safe_float(top.get('综合排名分')):.1f}\n\n"
             f"还差一次明确转强确认。历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
         )
     else:
         st.info(
-            f"**当前没有很强的买点。排名第一：{final_label}**｜{final_grade}｜综合分 {safe_float(top.get('综合分')):.1f}\n\n"
+            f"**当前没有很强的买点。排名第一：{final_label}**｜{final_grade}｜综合排名分 {safe_float(top.get('综合排名分')):.1f}\n\n"
             f"不要为了必须买而硬买。历史：{hist_state}｜新闻：{news_state}｜风险：{risk_label}"
         )
     top_ns, top_news_label, top_news_items = force_news_check(str(top["代码"]))
@@ -2847,11 +3009,12 @@ if rank is not None and not rank.empty:
     _lot_txt = f"¥{top['一手资金']:,.0f}" if math.isfinite(top['一手资金']) else "—"
     summary_df = pd.DataFrame([{
         "首选": stock_label(str(top["代码"])),
-        "综合分": format_num(top["综合分"],1),
+        "排名分": format_num(top["综合分"],1),
         "背景/触发": f"{format_num(top['背景分'],0)} / {format_num(top['触发分'],0)}",
         "一手资金": _lot_txt,
         "结论": top["结论"],
         "夜间PTS": _pts_txt,
+        "历史置信度": historical_confidence_label(top),
         "海外催化": format_num(top.get("海外催化分"),1),
     }])
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
@@ -2859,27 +3022,35 @@ if rank is not None and not rank.empty:
     st.caption(f"海外关联：{top.get('海外催化明细','未发现足够可靠且新鲜的海外关联信号')}")
 
     # Direct buy plan for the recommended No.1 name.
-    top_buy = buy_action_from_plan(top)
+    top_buy = buy_action_from_plan(top, mode)
     st.markdown("#### 💰 第一名怎么买")
 
-    _cur_txt = f"¥{top_buy['当前价']:.0f}" if math.isfinite(top_buy["当前价"]) else "—"
+    _ref_txt = f"¥{top_buy['当前参考价']:.0f}" if math.isfinite(top_buy["当前参考价"]) else "—"
+    _tse_txt = f"¥{top_buy['东证价']:.0f}" if math.isfinite(top_buy["东证价"]) else "—"
+    _pts_txt2 = f"¥{top_buy['PTS价']:.0f}" if math.isfinite(top_buy["PTS价"]) else "—"
     _zone_txt = (
         f"¥{top_buy['回踩下沿']:.0f} ～ ¥{top_buy['回踩上沿']:.0f}"
         if math.isfinite(top_buy["回踩下沿"]) and math.isfinite(top_buy["回踩上沿"]) else "—"
     )
-    _invalid_txt = f"¥{top_buy['失效位']:.0f}" if math.isfinite(top_buy["失效位"]) else "—"
+    _alert_txt = f"¥{top_buy['短线警戒位']:.0f}" if math.isfinite(top_buy["短线警戒位"]) else "—"
+    _struct_txt = f"¥{top_buy['结构失效位']:.0f}" if math.isfinite(top_buy["结构失效位"]) else "—"
 
-    b1,b2,b3 = st.columns([1,1.6,1])
-    b1.markdown("**当前价**<br>" + _cur_txt, unsafe_allow_html=True)
-    b2.markdown("**建议买入区间**<br>" + _zone_txt, unsafe_allow_html=True)
-    b3.markdown("**失效位**<br>" + _invalid_txt, unsafe_allow_html=True)
+    b1,b2,b3,b4 = st.columns([1,1.6,1,1])
+    b1.markdown(f"**判断参考价**<br>{_ref_txt}<br><small>{top_buy['参考价来源']}</small>", unsafe_allow_html=True)
+    b2.markdown("**建议买入观察区**<br>" + _zone_txt, unsafe_allow_html=True)
+    b3.markdown("**短线警戒位**<br>" + _alert_txt, unsafe_allow_html=True)
+    b4.markdown("**大结构失效**<br>" + _struct_txt, unsafe_allow_html=True)
+
+    st.caption(f"东证价 {_tse_txt}｜夜间PTS {_pts_txt2}｜PTS可信度 {format_num(top_buy.get('PTS可信度%'),0)}%")
 
     if top_buy["动作"].startswith("✅"):
-        _action_text = f"✅ **现在可买**：当前价 {_cur_txt} 已在建议买入区间 {_zone_txt} 内。"
+        _action_text = f"✅ **进入买入观察区**：{top_buy['参考价来源']} {_ref_txt} 已到 {_zone_txt}。先看5分钟承接/不再创新低，再考虑下单，不是机械自动买。"
     elif top_buy["动作"].startswith("⏳"):
-        _action_text = f"⏳ **先等回踩**：等价格回到 **{_zone_txt}** 再考虑，不建议在当前价 {_cur_txt} 直接追。"
+        _action_text = f"⏳ **先等回踩**：等价格回到 **{_zone_txt}** 再观察承接，不建议在 {_ref_txt} 直接追。"
+    elif "短线警戒" in top_buy["动作"]:
+        _action_text = f"⚠️ **取消机械低吸**：{top_buy['参考价来源']} {_ref_txt} 已跌破短线警戒 {_alert_txt}。先看能否重新收回警戒位/买入区。"
     elif top_buy["动作"].startswith("⚠️"):
-        _action_text = f"⚠️ **先别接**：价格已经跌破原计划买入区 {_zone_txt}，先观察能否重新稳住。"
+        _action_text = f"⚠️ **先别接**：{top_buy['参考价来源']} {_ref_txt} 已跌破原买入区 {_zone_txt}，先看是否重新收回。"
     else:
         _action_text = f"**动作**：{top_buy['动作']}"
 
@@ -2900,10 +3071,10 @@ if rank is not None and not rank.empty:
         st.caption(f"预测时间：{_analysis_time}｜{prediction_validation_rule(mode)}")
         top5_cols = [
             "排名","代码","日文名","中文名","预测价格","综合分","结论",
-            "买入计划类型","买入动作","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标","风险"
+            "买入计划类型","买入动作","回踩买入下沿","回踩买入上沿","短线警戒位","结构失效位","第一止盈","强势目标","历史置信度","风险"
         ]
         top5_view = snap[top5_cols].copy()
-        for c in ["预测价格","综合分","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标"]:
+        for c in ["预测价格","综合分","回踩买入下沿","回踩买入上沿","短线警戒位","结构失效位","第一止盈","强势目标"]:
             top5_view[c] = pd.to_numeric(top5_view[c], errors="coerce").round(2)
         st.dataframe(top5_view, use_container_width=True, hide_index=True)
 
@@ -2968,7 +3139,7 @@ if rank is not None and not rank.empty:
         if breakout_pool.empty:
             st.caption("今天没有股票通过『强势突破追强』风险门槛。宁可不追，也不把弱票突然暴拉当成主升突破。")
         else:
-            breakout_pool = breakout_pool.sort_values(["追强分","综合分"], ascending=False).head(8)
+            breakout_pool = breakout_pool.sort_values(["追强分","综合排名分"], ascending=False).head(8)
             breakout_pool["回踩计划"] = breakout_pool.apply(lambda rr: pullback_buy_plan(rr), axis=1)
             breakout_pool["回踩买入下沿"] = breakout_pool["回踩计划"].apply(lambda x: x["回踩下沿"])
             breakout_pool["回踩买入上沿"] = breakout_pool["回踩计划"].apply(lambda x: x["回踩上沿"])
@@ -2998,10 +3169,10 @@ if rank is not None and not rank.empty:
         pick = st.session_state.get("master_pick")
         if pick in pool["代码"].values:
             pr = pool[pool["代码"] == pick].iloc[0]
-            st.success(f"今日点兵：**{stock_label(pick)}**｜综合分 {pr['综合分']:.1f}｜安全回调分 {pr['安全回调分']:.1f}｜{pr['结论']}")
+            st.success(f"今日点兵：**{stock_label(pick)}**｜综合排名分 {pr['综合分']:.1f}｜安全回调分 {pr['安全回调分']:.1f}｜{pr['结论']}")
 
     st.markdown("#### 🛡️ 回调埋伏候选")
-    dip = rank[(rank["回调质量分"] >= 14) & (rank["背景分"] >= 22) & (rank["风险总惩罚"] < 18)].sort_values(["回调质量分","空间盈亏比分","综合分"], ascending=False).head(8)
+    dip = rank[(rank["回调质量分"] >= 14) & (rank["背景分"] >= 22) & (rank["风险总惩罚"] < 18)].sort_values(["回调质量分","空间盈亏比分","综合排名分"], ascending=False).head(8)
     if dip.empty:
         st.caption("今天没有满足‘强势 + 小回调 + 守支撑’的明显候选。")
     else:
@@ -3046,7 +3217,7 @@ if rank is not None and not rank.empty:
                 else:
                     st.error(f"{stock_label(str(best['代码']))} 虽然暴拉，但没有通过追强风险门槛；这种更接近需要防范的弱势反弹/假突破，不建议因为怕踏空硬追。")
             else:
-                st.success(f"当前规则下更优的是 **{stock_label(str(best['代码']))}**（综合分 {best['综合分']:.1f}，结论：{best['结论']}）。")
+                st.success(f"当前规则下更优的是 **{stock_label(str(best['代码']))}**（综合排名分 {best['综合分']:.1f}，结论：{best['结论']}）。")
                 st.write(
                     f"理由：背景 {format_num(best['背景分'])} / 触发 {format_num(best['触发分'])}｜20日 {format_num(best['20日%'])}%｜"
                     f"距支撑 {format_num(best['距支撑%'])}%｜ATR {format_num(best['ATR14%'])}%｜一手约 ¥{best['一手资金']:,.0f}｜资金友好 {format_num(best['资金友好分'])}。"
@@ -3105,10 +3276,11 @@ if rank is not None and not rank.empty:
 
     pb_single = pullback_buy_plan(row)
     st.markdown("### 🪂 回踩买入计划（预测时固定）")
-    pb1,pb2,pb3 = st.columns(3)
+    pb1,pb2,pb3,pb4 = st.columns(4)
     pb1.metric("计划类型", pb_single["类型"])
     pb2.metric("回踩买入区间", f"¥{pb_single['回踩下沿']:.0f} ～ ¥{pb_single['回踩上沿']:.0f}" if math.isfinite(pb_single["回踩下沿"]) else "—")
-    pb3.metric("失效参考", f"¥{pb_single['失效位']:.0f}" if math.isfinite(pb_single["失效位"]) else "—")
+    pb3.metric("短线警戒", f"¥{pb_single['短线警戒位']:.0f}" if math.isfinite(pb_single["短线警戒位"]) else "—")
+    pb4.metric("大结构失效", f"¥{pb_single['结构失效位']:.0f}" if math.isfinite(pb_single["结构失效位"]) else "—")
     st.caption(pb_single["说明"])
 
     st.markdown("### 🎯 止盈计划（固定显示）")
@@ -3137,59 +3309,7 @@ if rank is not None and not rank.empty:
 else:
     st.info("点击上面的“扫描 72 只股票”开始。首次加载可能稍慢。")
 
-with st.expander("📊 验证昨天/之前的预测 CSV", expanded=False):
-    st.markdown("""
-今天下载网站生成的 `prediction_....csv`。  
-到了验证日，把文件**直接拖到下面的框里**，然后点“开始判卷”。网站会自己抓实际行情，不用手填。
-""")
-    uploaded_pred = st.file_uploader(
-        "把之前下载的 prediction_....csv 拖到这里",
-        type=["csv"],
-        key="prediction_verify_upload",
-        accept_multiple_files=False,
-    )
-    if uploaded_pred is not None:
-        st.caption(f"已载入：{uploaded_pred.name}")
-        if st.button("📊 开始判卷", use_container_width=True, key="verify_prediction_btn"):
-            with st.spinner("正在抓实际行情并对照冻结预测…"):
-                verified_df, verify_err = verify_prediction_csv(uploaded_pred)
-            if verify_err:
-                st.error(verify_err)
-            elif verified_df is not None:
-                st.session_state["verified_prediction_df"] = verified_df
-
-    verified_df = st.session_state.get("verified_prediction_df")
-    if verified_df is not None and not verified_df.empty:
-        show_cols = [c for c in [
-            "排名","代码","日文名","中文名","模式","预测时间","预测价格",
-            "回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
-            "验证日期","实际开盘","实际最高","实际最低","实际收盘",
-            "最大浮盈%","最大浮亏%","收盘收益%","回踩买入区间触及",
-            "第一止盈命中","强势目标命中","失效位触及","低点后收盘反弹%","判卷结果"
-        ] if c in verified_df.columns]
-        view = verified_df[show_cols].copy()
-        for c in ["预测价格","回踩买入下沿","回踩买入上沿","失效位","第一止盈","强势目标",
-                  "实际开盘","实际最高","实际最低","实际收盘",
-                  "最大浮盈%","最大浮亏%","收盘收益%","低点后收盘反弹%"]:
-            if c in view.columns:
-                view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
-        st.dataframe(view, use_container_width=True, hide_index=True)
-
-        ok_count = verified_df["判卷结果"].astype(str).str.startswith("✅").sum() if "判卷结果" in verified_df.columns else 0
-        fail_count = verified_df["判卷结果"].astype(str).str.startswith("❌").sum() if "判卷结果" in verified_df.columns else 0
-        neutral_count = verified_df["判卷结果"].astype(str).str.startswith("🟡").sum() if "判卷结果" in verified_df.columns else 0
-        c1,c2,c3 = st.columns(3)
-        c1.metric("成功", int(ok_count))
-        c2.metric("一般/混乱", int(neutral_count))
-        c3.metric("失败", int(fail_count))
-
-        st.download_button(
-            "💾 下载判卷后的CSV",
-            data=verified_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="verified_predictions.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+# 预测判卷区已移到页面顶部，避免用户找不到。
 
 with st.expander("☁️ 跨天预测日志 / Supabase连接"):
     if supabase_configured():
