@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V19.1", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V19.2", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -281,23 +281,35 @@ def reward_risk_proxy(from_h20, support_gap, pullback_quality):
 
 
 def affordability_score(price, budget=300000):
-    """Capital friendliness for a standard 100-share cash lot. Never rescues a weak stock."""
+    """Capital friendliness for a standard 100-share cash lot.
+
+    V19.2: moderately stronger than before and relative to the user's actual budget.
+    Cheapness can separate otherwise comparable candidates, but never rescues a weak stock.
+    Maximum bonus is 14 points.
+    """
     if price is None or not math.isfinite(price) or price <= 0:
         return 0.0, np.nan, False
-    lot_cash = price * 100
+    lot_cash = float(price) * 100.0
+    budget = float(budget) if budget and math.isfinite(float(budget)) and float(budget) > 0 else 300000.0
     fits = lot_cash <= budget
-    # modest tie-breaker only; cap at 10 points
-    if lot_cash <= 100000:
-        s = 10
-    elif lot_cash <= 150000:
+    ratio = lot_cash / budget
+
+    # Moderate weighting: noticeably rewards usable 100-share lots without making price the main factor.
+    if ratio <= 0.35:
+        s = 14
+    elif ratio <= 0.50:
+        s = 13
+    elif ratio <= 0.70:
+        s = 11
+    elif ratio <= 0.90:
         s = 9
-    elif lot_cash <= 200000:
+    elif ratio <= 1.00:
         s = 8
-    elif lot_cash <= 300000:
-        s = 6
-    elif lot_cash <= 500000:
-        s = 3
-    elif lot_cash <= 800000:
+    elif ratio <= 1.25:
+        s = 5
+    elif ratio <= 1.60:
+        s = 2
+    elif ratio <= 2.00:
         s = 1
     else:
         s = 0
@@ -579,7 +591,7 @@ def mode_score(rank: pd.DataFrame, mode: str, budget: int):
     if "大引不成资格" not in r.columns:
         r["大引不成资格"] = False
 
-    # Cheapness is a tie-breaker only for healthy candidates, never a rescue factor.
+    # Capital friendliness is a medium-strength tie-breaker for healthy candidates, never a rescue factor.
     healthy = r["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
     score = pd.Series(score, index=r.index)
     score.loc[healthy] += cheap.loc[healthy]
@@ -1158,7 +1170,7 @@ def format_num(v, digits=1):
     return "—" if v is None or not math.isfinite(v) else f"{v:.{digits}f}"
 
 
-def scan_all(codes):
+def scan_all(codes, budget=300000):
     batch = download_daily(tuple(codes))
     rows = []
     raw = {}
@@ -1174,10 +1186,10 @@ def scan_all(codes):
     base["新闻分"] = 0.0
     base["新闻判断"] = "—"
     # Capital friendliness is a tie-breaker only. It is added later only for non-weak candidates.
-    aff = base["现价"].apply(lambda x: affordability_score(x, 300000))
+    aff = base["现价"].apply(lambda x: affordability_score(x, budget))
     base["资金友好分"] = [x[0] for x in aff]
     base["一手资金"] = [x[1] for x in aff]
-    base["30万预算可买一手"] = [x[2] for x in aff]
+    base["预算可买一手"] = [x[2] for x in aff]
     base["综合分"] = base["技术总分"]
     base = base.sort_values("综合分", ascending=False).reset_index(drop=True)
 
@@ -1196,7 +1208,7 @@ def scan_all(codes):
     base["追强理由"] = [x[2] for x in bo]
     base["追强风险"] = [x[3] for x in bo]
 
-    # Only healthy/neutral candidates can receive affordability bonus. Weak names never get rescued by low price.
+    # Only healthy/neutral candidates can receive the affordability bonus. Weak names never get rescued by low price.
     good_mask = base["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
     base.loc[good_mask, "综合分"] = (base.loc[good_mask, "综合分"] + base.loc[good_mask, "资金友好分"]).clip(-50, 100)
     base = base.sort_values(["综合分", "背景分", "触发分", "一手资金"], ascending=[False, False, False, True]).reset_index(drop=True)
@@ -2179,7 +2191,7 @@ def apply_global_catalysts(rank: pd.DataFrame, catalyst_map: dict, mode: str):
 
 
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V19.1")
+st.title("🎲 四时段强势回踩资金友好大师 V19.2")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -2227,13 +2239,13 @@ st.info(MODE_DESCRIPTIONS[mode])
 
 st.markdown("### 💴 资金偏好")
 budget = st.slider("单只股票最多愿意占用多少一手资金？", 100000, 1000000, 300000, 50000, format="¥%d")
-st.caption("这里只影响合格候选之间的排序。便宜不会救活弱票；真正抓行情仍按股票代码进行。")
+st.caption("资金权重已提高到中等：质量接近时，100股占用资金更少的票会明显占优；但便宜不会救活弱票。")
 
 
 if st.button("🧠 全自动分析", type="primary", use_container_width=True):
     with st.spinner("正在自动扫描行情、新闻、PTS、技术结构、历史回测和相似案例，并生成最终结论…"):
         # 1) Current market scan
-        rank0, raw0, news0 = scan_all(STOCK_CODES)
+        rank0, raw0, news0 = scan_all(STOCK_CODES, budget)
 
         # 2) Intraday structure when relevant
         if mode in ["盘中", "收盘前大引不成"]:
@@ -2551,7 +2563,7 @@ with st.expander("四个时段为什么分开算"):
 - **收盘前大引不成**：专门服务收盘集合竞价前的隔夜候选。重尾盘30分钟动量、尾盘量能、VWAP、日内位置和涨幅留存；尾盘跳水、冲高全吐、当天已经失控加速会被重罚。  
 - **收盘后预测明天**：重收盘质量、涨幅保留、全天量价和关键位是否守住；用于做第二天观察清单。  
 
-同一只票在四个模式得分不同是正常的。**资金友好度始终只作为合格候选之间的加分项，不会救活弱票。**
+同一只票在四个模式得分不同是正常的。**资金友好度现在是合格候选之间的中等权重加分项，不会救活弱票。**
 """)
 
 with st.expander("评分怎么判"):
@@ -2564,7 +2576,7 @@ with st.expander("评分怎么判"):
 **4. 波动风险**：增加 ATR14；波动极端、长上影、冲高回落会扣分，避免只看涨幅。  
 **5. 流动性**：日均成交额太低会扣分，减少小票被一次异动误判成强势。  
 **6. akippa式弱票**：刷新20日低点、低点连续下移、5/20日持续走弱、放量不涨，硬惩罚；跌得多不自动抄底。  
-**7. 资金友好度**：按日本现物常见100股一手估算 `现价×100`。只在 A/B 档候选里加最多10分；同样好时优先占用资金少的，弱票不会靠“便宜”翻身。  
+**7. 资金友好度**：按日本现物常见100股一手估算 `现价×100`，并相对你设定的单票预算动态评分。只在 A/B 档候选里加最多14分；质量接近时明显优先占用资金少的，弱票不会靠“便宜”翻身。  
 **8. 新闻催化**：只做佐证。业绩上修、受注、提携、自社株买等可加分；下修、增资、MS warrant 等扣分，但新闻不能覆盖技术面硬伤。  
 **9. 日股涨跌停**：按 JPX 通常制限值幅估算正常涨停/跌停；特殊扩大幅度日仍应以 JPX 公告为准。  
 **10. 涨幅保留率**：统计近期真正出现过盘中拉升的交易日，看收盘还能留下多少涨幅；能留住、收盘重心抬升加分，反复冲高全吐且失败次数多则扣分。  
