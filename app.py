@@ -1,4 +1,5 @@
 import math
+import html as html_lib
 import re
 import time
 import random
@@ -14,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V14", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V16", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -1528,9 +1529,246 @@ def apply_backtest_calibration(rank: pd.DataFrame, bt_map: dict):
     return r.sort_values(["模式分","回调质量分","背景分","触发分","一手资金"], ascending=[False,False,False,False,True]).reset_index(drop=True)
 
 
+
+
+# ---------- Automatic Night PTS ingestion ----------
+# Yahoo! Finance Japan displays Japannext J-Market night PTS on individual stock pages.
+# This is a public webpage rather than a formal market-data API, so failure must degrade to "no signal",
+# never to invented data.
+YAHOO_QUOTE_URL = "https://finance.yahoo.co.jp/quote/{code}.T"
+
+def _html_to_text(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    s = re.sub(r"(?is)<script.*?</script>", " ", raw_html)
+    s = re.sub(r"(?is)<style.*?</style>", " ", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = html_lib.unescape(s)
+    s = s.replace("−", "-").replace("▲", "").replace("▼", "")
+    return re.sub(r"\s+", " ", s).strip()
+
+def _parse_pts_timestamp(md_hm: str):
+    """Parse strings like 10/7 20:11 into JST, handling year rollover."""
+    try:
+        now = datetime.now(JST)
+        m = re.search(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", md_hm or "")
+        if not m:
+            return None
+        month, day, hour, minute = map(int, m.groups())
+        dt = datetime(now.year, month, day, hour, minute, tzinfo=JST)
+        if dt > now + timedelta(days=2):
+            dt = dt.replace(year=now.year - 1)
+        return dt
+    except Exception:
+        return None
+
+def _current_pts_session_start(now=None):
+    """Return the start of the PTS session relevant to the next TSE session.
+    17:00-23:59 => today 17:00
+    00:00-08:59 => yesterday 17:00
+    09:00-16:59 => no relevant live overnight session for next-day scoring yet.
+    """
+    now = now or datetime.now(JST)
+    if now.hour >= 17:
+        return now.replace(hour=17, minute=0, second=0, microsecond=0)
+    if now.hour < 9:
+        prev = now - timedelta(days=1)
+        return prev.replace(hour=17, minute=0, second=0, microsecond=0)
+    return None
+
+def _num(s):
+    try:
+        return float(str(s).replace(",", "").replace("+", "").strip())
+    except Exception:
+        return np.nan
+
+def _parse_yahoo_pts_html(code: str, raw_html: str):
+    t = _html_to_text(raw_html)
+    if not t or "夜間PTS" not in t:
+        return None
+
+    # Prefer the compact header: 夜間PTS 751 東証終値比 0(0.00%) 10/6 20:11
+    p = re.search(
+        r"夜間PTS\s*([0-9,]+(?:\.[0-9]+)?)\s*東証終値比\s*([+\-]?[0-9,]+(?:\.[0-9]+)?)\s*"
+        r"\(([+\-]?[0-9.]+)%\)\s*(\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2})",
+        t
+    )
+
+    # Fallback to the detail line: 取引値 / 東証終値比 ...
+    if not p:
+        p = re.search(
+            r"取引値\s*/\s*東証終値比\s*([0-9,]+(?:\.[0-9]+)?)\s*([+\-]?[0-9,]+(?:\.[0-9]+)?)\s*"
+            r"\(([+\-]?[0-9.]+)%\).*?(\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2})",
+            t
+        )
+
+    if not p:
+        return None
+
+    price = _num(p.group(1))
+    change = _num(p.group(2))
+    change_pct = _num(p.group(3))
+    stamp_text = p.group(4)
+    stamp = _parse_pts_timestamp(stamp_text)
+
+    # Slice from the PTS explanatory/detail section to avoid accidentally reading TSE volume.
+    detail_pos = t.find("夜間PTSについて")
+    detail = t[detail_pos:] if detail_pos >= 0 else t[t.find("夜間PTS"):]
+    vm = re.search(r"出来高\s*([0-9,]+)\s*株", detail)
+    tm = re.search(r"売買代金\s*([0-9,]+)\s*千円", detail)
+    volume = int(_num(vm.group(1))) if vm and math.isfinite(_num(vm.group(1))) else 0
+    turnover_yen = _num(tm.group(1)) * 1000 if tm else (price * volume if math.isfinite(price) else np.nan)
+
+    om = re.search(r"始値\s*([0-9,]+(?:\.[0-9]+)?)", detail)
+    hm = re.search(r"高値\s*([0-9,]+(?:\.[0-9]+)?)", detail)
+    lm = re.search(r"安値\s*([0-9,]+(?:\.[0-9]+)?)", detail)
+
+    return {
+        "代码": code,
+        "PTS价格": price,
+        "PTS涨跌": change,
+        "PTS涨跌%": change_pct,
+        "PTS时间": stamp.strftime("%m/%d %H:%M") if stamp else stamp_text,
+        "PTS_dt": stamp,
+        "PTS成交量": volume,
+        "PTS成交额": turnover_yen,
+        "PTS始值": _num(om.group(1)) if om else np.nan,
+        "PTS高值": _num(hm.group(1)) if hm else np.nan,
+        "PTS低值": _num(lm.group(1)) if lm else np.nan,
+        "PTS来源": "Yahoo! Finance Japan / Japannext J-Market",
+    }
+
+def _fetch_pts_one(code: str):
+    try:
+        url = YAHOO_QUOTE_URL.format(code=code)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36",
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.6",
+        }
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code != 200:
+            return None
+        r.encoding = r.apparent_encoding or r.encoding
+        return _parse_yahoo_pts_html(code, r.text)
+    except Exception:
+        return None
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_pts_universe(codes_tuple):
+    """Fetch night PTS for the whole pool concurrently.
+    Cached for 2 minutes to avoid repeatedly hitting public pages.
+    """
+    out = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(_fetch_pts_one, c): c for c in codes_tuple}
+        for fut in as_completed(futures):
+            code = futures[fut]
+            try:
+                x = fut.result()
+                if x:
+                    out[code] = x
+            except Exception:
+                pass
+    return out
+
+def _pts_confidence(pts_turnover_yen, avg_daily_turnover_yen):
+    """Liquidity confidence from PTS turnover relative to normal daily turnover.
+    Tiny PTS prints receive almost no weight.
+    """
+    p = safe_float(pts_turnover_yen)
+    d = safe_float(avg_daily_turnover_yen)
+    if not math.isfinite(p) or p <= 0:
+        return 0.0
+    if math.isfinite(d) and d > 0:
+        ratio = p / d
+        # 0.05% daily value = nearly noise; ~2%+ = meaningful overnight participation.
+        conf = np.clip((math.log10(max(ratio, 1e-6)) + 3.3) / 1.6, 0.05, 1.0)
+    else:
+        # Absolute fallback when average turnover is unavailable.
+        if p < 300_000:
+            conf = 0.05
+        elif p < 2_000_000:
+            conf = 0.20
+        elif p < 10_000_000:
+            conf = 0.45
+        elif p < 50_000_000:
+            conf = 0.70
+        else:
+            conf = 1.0
+    return float(conf)
+
+def apply_pts_features(rank: pd.DataFrame, pts_map: dict, mode: str):
+    """Attach PTS fields and cautiously adjust next-session scores.
+    PTS matters only in '收盘后预测明天' and '开盘前', and only for the currently relevant PTS session.
+    """
+    r = rank.copy()
+    defaults = {
+        "PTS价格":np.nan, "PTS涨跌%":np.nan, "PTS成交量":0, "PTS成交额":np.nan,
+        "PTS时间":"—", "PTS可信度%":0.0, "PTS调整分":0.0, "PTS状态":"无有效PTS",
+    }
+    for k,v in defaults.items():
+        r[k] = v
+
+    session_start = _current_pts_session_start()
+    active_for_scoring = mode in ["收盘后预测明天", "开盘前"] and session_start is not None
+
+    for idx, row in r.iterrows():
+        code = str(row["代码"])
+        p = (pts_map or {}).get(code)
+        if not p:
+            continue
+
+        for k in ["PTS价格","PTS涨跌%","PTS成交量","PTS成交额","PTS时间"]:
+            r.at[idx, k] = p.get(k, defaults.get(k))
+
+        stamp = p.get("PTS_dt")
+        fresh = bool(stamp and session_start and stamp >= session_start)
+        conf = _pts_confidence(p.get("PTS成交额"), row.get("20日均成交额"))
+        r.at[idx, "PTS可信度%"] = conf * 100
+
+        if not active_for_scoring:
+            r.at[idx, "PTS状态"] = "已取得｜当前时段不计分"
+            continue
+        if not fresh:
+            r.at[idx, "PTS状态"] = "PTS过期/非本轮夜盘｜不计分"
+            continue
+
+        pctv = safe_float(p.get("PTS涨跌%"))
+        if not math.isfinite(pctv):
+            r.at[idx, "PTS状态"] = "已取得但涨跌不可用"
+            continue
+
+        # Cap both the move and its influence. PTS is a supporting signal, not the main engine.
+        adj = float(np.clip(pctv, -8, 8) * conf * 0.75)
+
+        # Extra caution when a huge move comes from tiny turnover.
+        if abs(pctv) >= 5 and conf < 0.20:
+            adj *= 0.25
+            status = "低成交PTS异动｜仅弱参考"
+        elif conf >= 0.65:
+            status = "PTS有效｜高可信"
+        elif conf >= 0.30:
+            status = "PTS有效｜中可信"
+        else:
+            status = "PTS有效｜低可信"
+
+        r.at[idx, "PTS调整分"] = adj
+        r.at[idx, "PTS状态"] = status
+
+    if active_for_scoring:
+        r["模式分"] = (r["模式分"] + r["PTS调整分"]).clip(-50, 100)
+        r["综合分"] = r["模式分"]
+        r = r.sort_values(
+            ["模式分","回调质量分","背景分","触发分","一手资金"],
+            ascending=[False,False,False,False,True]
+        ).reset_index(drop=True)
+    return r
+
+
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V14")
-st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 免费行情可能延迟")
+st.title("🎲 四时段强势回踩资金友好大师 V16")
+
+st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
 with st.expander("先看核心纪律（网站会强制执行）", expanded=True):
     for x in RULES:
@@ -1559,6 +1797,10 @@ if "bt_case_count" not in st.session_state:
     st.session_state.bt_case_count = 0
 if "bt_time" not in st.session_state:
     st.session_state.bt_time = None
+if "pts_map" not in st.session_state:
+    st.session_state.pts_map = None
+if "pts_fetch_time" not in st.session_state:
+    st.session_state.pts_fetch_time = None
 
 st.markdown("### 🕒 分析时段")
 mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘前大引不成", "收盘后预测明天"], horizontal=True)
@@ -1580,6 +1822,12 @@ with left:
             st.session_state.raw = raw
             st.session_state.news = news
             st.session_state.scan_mode = mode
+            if mode in ["收盘后预测明天", "开盘前"] and _current_pts_session_start() is not None:
+                st.session_state.pts_map = fetch_pts_universe(tuple(STOCK_CODES))
+                st.session_state.pts_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+            else:
+                st.session_state.pts_map = None
+                st.session_state.pts_fetch_time = None
             # New scan invalidates old calibration because the current feature point changed.
             st.session_state.bt_map = None
             st.session_state.bt_case_count = 0
@@ -1596,6 +1844,9 @@ with middle:
                 st.session_state.raw = raw0
                 st.session_state.news = news0
                 st.session_state.scan_mode = mode
+                if mode in ["收盘后预测明天", "开盘前"] and _current_pts_session_start() is not None:
+                    st.session_state.pts_map = fetch_pts_universe(tuple(STOCK_CODES))
+                    st.session_state.pts_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
             bt_map, bt_n = run_one_click_backtest(st.session_state.raw or {})
             st.session_state.bt_map = bt_map
             st.session_state.bt_case_count = bt_n
@@ -1614,6 +1865,14 @@ if rank is not None and not rank.empty:
         intra = download_intraday(tuple(STOCK_CODES))
         rank = apply_intraday_features(rank, intra)
     rank = mode_score(rank, mode, budget)
+    # Night PTS is automatically incorporated when a relevant overnight session is active.
+    if mode in ["收盘后预测明天", "开盘前"] and _current_pts_session_start() is not None:
+        if st.session_state.pts_map is None:
+            st.session_state.pts_map = fetch_pts_universe(tuple(STOCK_CODES))
+            st.session_state.pts_fetch_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+        rank = apply_pts_features(rank, st.session_state.pts_map or {}, mode)
+    else:
+        rank = apply_pts_features(rank, {}, mode)
     if st.session_state.bt_map:
         rank = apply_backtest_calibration(rank, st.session_state.bt_map)
     else:
@@ -1624,12 +1883,16 @@ if rank is not None and not rank.empty:
     top_ns, top_news_label, top_news_items = force_news_check(str(top["代码"]))
     top["新闻分"] = top_ns
     top["新闻判断"] = top_news_label
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("第一名", stock_label(str(top["代码"])))
     c2.metric(f"{mode}分", format_num(top["综合分"],1))
     c3.metric("背景 / 触发", f"{format_num(top['背景分'],0)} / {format_num(top['触发分'],0)}")
     c4.metric("一手资金", f"¥{top['一手资金']:,.0f}" if math.isfinite(top['一手资金']) else "—")
     c5.metric("结论", top["结论"])
+    if math.isfinite(safe_float(top.get("PTS涨跌%"))):
+        c6.metric("夜间PTS", f"{format_num(top.get('PTS涨跌%'))}%", help=str(top.get("PTS状态","")))
+    else:
+        c6.metric("夜间PTS", "—")
     st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
 
     if st.session_state.bt_map:
@@ -1672,11 +1935,12 @@ if rank is not None and not rank.empty:
             st.caption("今天没有股票通过『强势突破追强』风险门槛。宁可不追，也不把弱票突然暴拉当成主升突破。")
         else:
             breakout_pool = breakout_pool.sort_values(["追强分","综合分"], ascending=False).head(8)
-            st.dataframe(
-                breakout_pool[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距20日高%","追强分","近10日冲高保留率%","冲高失败次数","弱势惩罚","追强理由","追强风险"]].round(2),
-                use_container_width=True,
-                hide_index=True
-            )
+            bo_cols = ["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距20日高%","追强分","近10日冲高保留率%","冲高失败次数","弱势惩罚","PTS涨跌%","PTS可信度%","PTS调整分","追强理由","追强风险"]
+            bo_cols = [c for c in bo_cols if c in breakout_pool.columns]
+            bo_df = breakout_pool.loc[:, bo_cols].copy()
+            bo_num = [c for c in bo_cols if c not in ["代码","日文名","中文名","追强理由","追强风险"]]
+            bo_df[bo_num] = bo_df[bo_num].round(2)
+            st.dataframe(bo_df, use_container_width=True, hide_index=True)
 
     # Fun layer: rules first, randomness second. Weak/broken names are never admitted to the draw.
     st.markdown("#### 🎲 大师点兵：先过纪律，再交给一点运气")
@@ -1706,7 +1970,7 @@ if rank is not None and not rank.empty:
         st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","回调质量分","上方空间/支撑风险比","背景分","触发分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### 排名表")
-    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","追强资格","追强分","追强理由","追强风险","历史状态","历史校准分","次日上涨概率%","3日延续概率%","3日假突破风险%","相似样本","自身样本","新闻判断","风险标签"]
+    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","追强资格","追强分","追强理由","追强风险","历史状态","历史校准分","次日上涨概率%","3日延续概率%","3日假突破风险%","相似样本","自身样本","PTS价格","PTS涨跌%","PTS成交量","PTS成交额","PTS可信度%","PTS调整分","PTS状态","PTS时间","新闻判断","风险标签"]
     if mode in ["盘中", "收盘前大引不成"]:
         extras = ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]
         if mode == "收盘前大引不成":
@@ -1714,8 +1978,10 @@ if rank is not None and not rank.empty:
         for extra in extras:
             if extra in rank.columns:
                 show_cols.insert(6, extra)
-    display_df = rank[show_cols].copy()
-    num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","历史状态","新闻判断","风险标签","追强理由","追强风险"]]
+    # Some columns exist only after optional modules (e.g. backtest). Never crash the whole app for a missing display-only column.
+    show_cols = [c for c in show_cols if c in rank.columns]
+    display_df = rank.loc[:, show_cols].copy()
+    num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","历史状态","PTS状态","PTS时间","新闻判断","风险标签","追强理由","追强风险"]]
     display_df[num_cols] = display_df[num_cols].round(2)
     st.dataframe(display_df, use_container_width=True, hide_index=True, height=620)
 
@@ -1769,6 +2035,8 @@ if rank is not None and not rank.empty:
     m5.metric("ATR14", f"{format_num(row['ATR14%'])}%")
     m6.metric("综合分", format_num(row["综合分"]))
     st.write(f"**结论：{row['结论']}**｜{row['风险标签']}｜{row['新闻判断']}")
+    st.link_button("🌙 查看这只股票夜間PTS", yahoo_pts_url(str(selected)), use_container_width=True)
+
 
     if st.session_state.bt_map and str(selected) in st.session_state.bt_map:
         br = st.session_state.bt_map[str(selected)]
