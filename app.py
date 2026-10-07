@@ -18,9 +18,87 @@ st.set_page_config(page_title="强势回踩点兵大师", page_icon="🎲", layo
 
 JST = timezone(timedelta(hours=9))
 
-STOCK_CODES = [
-    "627A","6203","485A","634A","6904","4073","6533","625A","5706","2980","5802","6920","7013","7012","8593","5016","6208","4274","4440","4052","604A","8848","6330","5801","8267","3103","3110","3003","200A","3350","3231","3101","5713","6701","4564","1615","4063","2502","7203","7261","3905","5074","4901","6526","8001","8306","2768","1570","6305","4062","285A","5803","6758","4755","9432","8136","4661","3038","282A","9984","7974","8035","6146","6857","6981","3778","3099","6976","6367","6506","7936","8058"
+STOCKS = [
+    ("627A", "ａｋｉｐｐａ", "akippa"),
+    ("6203", "豊和工業", "丰和工业"),
+    ("485A", "パワーエックス", "PowerX"),
+    ("634A", "レイヤード", "Layered"),
+    ("6904", "原田工業", "原田工业"),
+    ("4073", "ジィ・シィ企画", "GC企划"),
+    ("6533", "Orchestra Holdings", "Orchestra控股"),
+    ("625A", "Skyfall", "Skyfall"),
+    ("5706", "三井金属", "三井金属"),
+    ("2980", "SREホールディングス", "SRE控股"),
+    ("5802", "住友電気工業", "住友电工"),
+    ("6920", "レーザーテック", "Lasertec"),
+    ("7013", "IHI", "IHI"),
+    ("7012", "川崎重工業", "川崎重工"),
+    ("8593", "三菱HCキャピタル", "三菱HC资本"),
+    ("5016", "JX金属", "JX金属"),
+    ("6208", "石川製作所", "石川制作所"),
+    ("4274", "細谷火工", "细谷火工"),
+    ("4440", "ヴィッツ", "Vitz"),
+    ("4052", "フィーチャ", "Ficha"),
+    ("604A", "ビーエイブル", "B-able"),
+    ("8848", "レオパレス21", "Leopalace21"),
+    ("6330", "東洋エンジニアリング", "东洋工程"),
+    ("5801", "古河電気工業", "古河电工"),
+    ("8267", "イオン", "永旺"),
+    ("3103", "ユニチカ", "尤尼吉可"),
+    ("3110", "日東紡績", "日东纺织"),
+    ("3003", "ヒューリック", "Hulic"),
+    ("200A", "NEXT FUNDS 日経半導体株指数連動型上場投信", "NEXT FUNDS日经半导体ETF"),
+    ("3350", "メタプラネット", "Metaplanet"),
+    ("3231", "野村不動産ホールディングス", "野村不动产控股"),
+    ("3101", "東洋紡", "东洋纺"),
+    ("5713", "住友金属鉱山", "住友金属矿山"),
+    ("6701", "NEC", "NEC"),
+    ("4564", "オンコセラピー・サイエンス", "OncoTherapy Science"),
+    ("1615", "NEXT FUNDS 東証銀行業株価指数連動型上場投信", "NEXT FUNDS东证银行业ETF"),
+    ("4063", "信越化学工業", "信越化学"),
+    ("2502", "アサヒグループホールディングス", "朝日集团控股"),
+    ("7203", "トヨタ自動車", "丰田汽车"),
+    ("7261", "マツダ", "马自达"),
+    ("3905", "データセクション", "DataSection"),
+    ("5074", "テスホールディングス", "TESS控股"),
+    ("4901", "富士フイルムホールディングス", "富士胶片控股"),
+    ("6526", "ソシオネクスト", "Socionext"),
+    ("8001", "伊藤忠商事", "伊藤忠商事"),
+    ("8306", "三菱UFJフィナンシャル・グループ", "三菱UFJ金融集团"),
+    ("2768", "双日", "双日"),
+    ("1570", "NEXT FUNDS 日経平均レバレッジ・インデックス連動型上場投信", "NEXT FUNDS日经平均杠杆ETF"),
+    ("6305", "日立建機", "日立建机"),
+    ("4062", "イビデン", "揖斐电"),
+    ("285A", "キオクシアホールディングス", "铠侠控股"),
+    ("5803", "フジクラ", "藤仓"),
+    ("6758", "ソニーグループ", "索尼集团"),
+    ("4755", "楽天グループ", "乐天集团"),
+    ("9432", "NTT", "NTT"),
+    ("8136", "サンリオ", "三丽鸥"),
+    ("4661", "オリエンタルランド", "东方乐园"),
+    ("3038", "神戸物産", "神户物产"),
+    ("282A", "Global X 半導体・トップ10-日本株式", "Global X日本半导体Top10 ETF"),
+    ("9984", "ソフトバンクグループ", "软银集团"),
+    ("7974", "任天堂", "任天堂"),
+    ("8035", "東京エレクトロン", "东京电子"),
+    ("6146", "ディスコ", "DISCO"),
+    ("6857", "アドバンテスト", "爱德万测试"),
+    ("6981", "村田製作所", "村田制作所"),
+    ("3778", "さくらインターネット", "樱花互联网"),
+    ("3099", "三越伊勢丹ホールディングス", "三越伊势丹控股"),
+    ("6976", "太陽誘電", "太阳诱电"),
+    ("6367", "ダイキン工業", "大金工业"),
+    ("6506", "安川電機", "安川电机"),
+    ("7936", "アシックス", "亚瑟士"),
+    ("8058", "三菱商事", "三菱商事"),
 ]
+STOCK_CODES = [x[0] for x in STOCKS]
+STOCK_META = {code: {"jp": jp, "zh": zh} for code, jp, zh in STOCKS}
+
+def stock_label(code: str) -> str:
+    m = STOCK_META.get(code, {})
+    return f"{code}｜{m.get('jp','')}｜{m.get('zh','')}"
+
 
 RULES = [
     "原本就强 + 回踩不破关键位 + 再次转强，才考虑买。",
@@ -248,8 +326,11 @@ def analyze_daily(df: pd.DataFrame, code: str):
     technical = strong_score + pullback_score + turn_score + safe_pullback_score - penalties
     technical = float(np.clip(technical, -50, 100))
 
+    meta = STOCK_META.get(code, {})
     return {
         "代码": code,
+        "日文名": meta.get("jp", ""),
+        "中文名": meta.get("zh", ""),
         "现价": c,
         "日涨跌%": r1,
         "5日%": r5,
@@ -281,7 +362,9 @@ def analyze_daily(df: pd.DataFrame, code: str):
 
 def fetch_news(code: str, max_items=6):
     # No API key. Public RSS; availability depends on network / Google response.
-    query = urllib.parse.quote(f"{code} 株 OR {code} 決算 OR {code} 提携 OR {code} 受注")
+    meta = STOCK_META.get(code, {})
+    jp = meta.get("jp", "")
+    query = urllib.parse.quote(f"{code} {jp} 株 OR {code} {jp} 決算 OR {code} {jp} 提携 OR {code} {jp} 受注")
     url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -393,7 +476,7 @@ def scan_all(codes):
 def chart_for(code, raw_df, support=None):
     d = raw_df.tail(60).copy()
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=code))
+    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=stock_label(code)))
     ma5 = d["Close"].rolling(5).mean()
     ma20 = d["Close"].rolling(20).mean()
     fig.add_trace(go.Scatter(x=d.index, y=ma5, mode="lines", name="MA5"))
@@ -421,6 +504,7 @@ with colC:
     st.metric("数据刷新", datetime.now(JST).strftime("%Y-%m-%d %H:%M JST"))
 
 st.warning("这不是自动下单系统。免费公开行情可能延迟或缺失；推荐结果是筛选/排序，不是收益保证。尤其盘中快速波动时，请用券商盘口确认价格后再行动。")
+st.caption("身份显示统一为：代码｜日文名｜中文译名。行情仍按代码.T抓取；代码与公司名分开保存，避免把名字当代码或串票。")
 
 if "scan" not in st.session_state:
     st.session_state.scan = None
@@ -448,11 +532,11 @@ if rank is not None and not rank.empty:
     st.subheader("今天优先看谁")
     top = rank.iloc[0]
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("第一名", str(top["代码"]))
+    c1.metric("第一名", stock_label(str(top["代码"])))
     c2.metric("综合分", format_num(top["综合分"],1))
     c3.metric("20日涨跌", f"{format_num(top['20日%'],1)}%")
     c4.metric("结论", top["结论"])
-    st.info(f"第一名 {top['代码']}：{top['风险标签']}；{top['新闻判断']}。注意：第一名也必须等实际盘口确认，不等于无脑买。")
+    st.info(f"第一名 {stock_label(str(top['代码']))}：{top['风险标签']}；{top['新闻判断']}。注意：第一名也必须等实际盘口确认，不等于无脑买。")
 
     # Fun layer: rules first, randomness second. Weak/broken names are never admitted to the draw.
     st.markdown("#### 🎲 大师点兵：先过纪律，再交给一点运气")
@@ -472,19 +556,19 @@ if rank is not None and not rank.empty:
         pick = st.session_state.get("master_pick")
         if pick in pool["代码"].values:
             pr = pool[pool["代码"] == pick].iloc[0]
-            st.success(f"今日点兵：**{pick}**｜综合分 {pr['综合分']:.1f}｜安全回调分 {pr['安全回调分']:.1f}｜{pr['结论']}")
+            st.success(f"今日点兵：**{stock_label(pick)}**｜综合分 {pr['综合分']:.1f}｜安全回调分 {pr['安全回调分']:.1f}｜{pr['结论']}")
 
     st.markdown("#### 🛡️ 回调埋伏候选")
     dip = rank[(rank["安全回调分"] >= 10) & (rank["强势分"] >= 8) & (rank["弱势惩罚"] < 18)].sort_values(["安全回调分","综合分"], ascending=False).head(8)
     if dip.empty:
         st.caption("今天没有满足‘强势 + 小回调 + 守支撑’的明显候选。")
     else:
-        st.dataframe(dip[["代码","现价","日涨跌%","20日%","距支撑%","距20日高%","安全回调分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
+        st.dataframe(dip[["代码","日文名","中文名","现价","日涨跌%","20日%","距支撑%","距20日高%","安全回调分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### 排名表")
-    show_cols = ["代码","结论","综合分","现价","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","强势分","回踩分","转强分","安全回调分","弱势惩罚","新闻判断","风险标签"]
+    show_cols = ["代码","日文名","中文名","结论","综合分","现价","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","强势分","回踩分","转强分","安全回调分","弱势惩罚","新闻判断","风险标签"]
     display_df = rank[show_cols].copy()
-    num_cols = [c for c in show_cols if c not in ["代码","结论","新闻判断","风险标签"]]
+    num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","新闻判断","风险标签"]]
     display_df[num_cols] = display_df[num_cols].round(2)
     st.dataframe(display_df, use_container_width=True, hide_index=True, height=620)
 
@@ -501,7 +585,7 @@ if rank is not None and not rank.empty:
             if "追" in q and math.isfinite(best["日涨跌%"] or np.nan) and best["日涨跌%"] >= 6:
                 st.error(f"{best['代码']} 今天已经明显拉升。按你的纪律：**不追突然暴拉**。等回踩守住关键位、再度转强再看。")
             else:
-                st.success(f"当前规则下更优的是 **{best['代码']}**（综合分 {best['综合分']:.1f}，结论：{best['结论']}）。")
+                st.success(f"当前规则下更优的是 **{stock_label(str(best['代码']))}**（综合分 {best['综合分']:.1f}，结论：{best['结论']}）。")
                 st.write(
                     f"理由：20日 {format_num(best['20日%'])}%｜距20日高 {format_num(best['距20日高%'])}%｜距支撑 {format_num(best['距支撑%'])}%｜"
                     f"强势 {format_num(best['强势分'])} / 回踩 {format_num(best['回踩分'])} / 再转强 {format_num(best['转强分'])}｜弱势惩罚 {format_num(best['弱势惩罚'])}。"
@@ -510,7 +594,7 @@ if rank is not None and not rank.empty:
 
     st.divider()
     st.subheader("单票诊断")
-    selected = st.selectbox("股票代码", rank["代码"].tolist())
+    selected = st.selectbox("股票", rank["代码"].tolist(), format_func=stock_label)
     row = rank[rank["代码"] == selected].iloc[0]
     m1,m2,m3,m4,m5 = st.columns(5)
     m1.metric("现价", format_num(row["现价"],1))
@@ -541,7 +625,7 @@ else:
     st.info("点击上面的“扫描 72 只股票”开始。首次加载可能稍慢。")
 
 with st.expander("股票池（72只）"):
-    st.code("\n".join(STOCK_CODES), language="text")
+    st.dataframe(pd.DataFrame(STOCKS, columns=["代码","日文正式/常用名","中文译名"]), use_container_width=True, hide_index=True)
 
 with st.expander("评分怎么判"):
     st.markdown("""
