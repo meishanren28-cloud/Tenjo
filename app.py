@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师 V17", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V17.1", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -1766,7 +1766,7 @@ def apply_pts_features(rank: pd.DataFrame, pts_map: dict, mode: str):
 
 
 # ---------- UI ----------
-st.title("🎲 四时段强势回踩资金友好大师 V17")
+st.title("🎲 四时段强势回踩资金友好大师 V17.1")
 
 st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 一键2年历史回测/相似结构校准 · 夜间PTS自动参考（Yahoo/Japannext） · 免费行情可能延迟")
 
@@ -2051,7 +2051,6 @@ if rank is not None and not rank.empty:
     m5.metric("ATR14", f"{format_num(row['ATR14%'])}%")
     m6.metric("综合分", format_num(row["综合分"]))
     st.write(f"**结论：{row['结论']}**｜{row['风险标签']}｜{row['新闻判断']}")
-    st.link_button("🌙 查看这只股票夜間PTS", yahoo_pts_url(str(selected)), use_container_width=True)
 
 
     if st.session_state.bt_map and str(selected) in st.session_state.bt_map:
