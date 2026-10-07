@@ -553,9 +553,13 @@ def calc_rsi(close: pd.Series, n=14):
 
 
 def analyze_daily(df: pd.DataFrame, code: str):
-    if df is None or df.empty or "Close" not in df.columns or len(df.dropna(subset=["Close"])) < 22:
+    # New IPOs may have fewer than 20 trading days. Do NOT silently drop them from the stock pool.
+    # Five daily bars is the minimum for a basic short-term read; unavailable long-window metrics stay NaN
+    # and are explicitly treated as "insufficient history" rather than invented.
+    if df is None or df.empty or "Close" not in df.columns or len(df.dropna(subset=["Close"])) < 5:
         return None
     d = df.dropna(subset=["Close"]).copy()
+    history_days = len(d)
     for col in ["Open","High","Low","Volume"]:
         if col not in d.columns:
             d[col] = np.nan
@@ -686,6 +690,8 @@ def analyze_daily(df: pd.DataFrame, code: str):
     meta = STOCK_META.get(code, {})
     return {
         "代码": code,
+        "历史交易日": history_days,
+        "历史完整度": "完整" if history_days >= 22 else f"新股/短历史（{history_days}日）",
         "日文名": meta.get("jp", ""),
         "中文名": meta.get("zh", ""),
         "现价": c,
@@ -983,7 +989,7 @@ with colC:
     st.metric("数据刷新", datetime.now(JST).strftime("%Y-%m-%d %H:%M JST"))
 
 st.warning("这不是自动下单系统。免费公开行情可能延迟或缺失；推荐结果是筛选/排序，不是收益保证。尤其盘中快速波动时，请用券商盘口确认价格后再行动。")
-st.caption("身份显示统一为：代码｜日文名｜中文译名。行情仍按代码.T抓取；代码与公司名分开保存，避免把名字当代码或串票。")
+st.caption("身份显示统一为：代码｜日文名｜中文译名。行情仍按代码.T抓取；代码与公司名分开保存，避免把名字当代码或串票。新股历史不足20日时仍保留在股票池与诊断中，缺失的MA20/20日指标显示为不可用，不会凭空补数。")
 
 if "scan" not in st.session_state:
     st.session_state.scan = None
@@ -1131,6 +1137,8 @@ if rank is not None and not rank.empty:
     m5.metric("ATR14", f"{format_num(row['ATR14%'])}%")
     m6.metric("综合分", format_num(row["综合分"]))
     st.write(f"**结论：{row['结论']}**｜{row['风险标签']}｜{row['新闻判断']}")
+    if "历史完整度" in row.index and row["历史完整度"] != "完整":
+        st.warning(f"⚠️ {row['历史完整度']}：MA20、20日涨幅等长周期指标可能不可用或参考价值较低；系统不会因此把这只新股从股票池删除。")
     p1,p2,p3 = st.columns(3)
     p1.metric("通常涨停价", format_num(row["正常涨停价"],1))
     p2.metric("通常跌停价", format_num(row["正常跌停价"],1))
