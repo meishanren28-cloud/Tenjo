@@ -111,6 +111,8 @@ RULES = [
     "随机只用于合格候选之间的点兵，不允许把连续创新低、破位弱票随机成买入候选。",
     "资金少也是现实约束：在质量相近的合格候选里，优先一手资金更低、资金利用率更高的股票。",
     "便宜只做同档候选的加分项，绝不能让低价弱票因为便宜就越过结构更好的强票。",
+    "重视涨幅保留率：冲高后能把大部分涨幅留到收盘、连续几天收盘重心抬高，加分；反复冲高全吐、收盘越来越低，扣分。",
+    "一旦给出可买/推荐，必须同时给动态止盈参考：结合买入价、ATR、近期前高/压力位和通常涨停价，而不是统一写死+5%。",
 ]
 
 POSITIVE_KW = [
@@ -411,8 +413,13 @@ def analyze_daily(df: pd.DataFrame, code: str):
         elif avg_value20 < 300_000_000:
             liquidity_penalty = 5
 
+    # Rally-retention quality: strong names should keep at least part of their intraday gains instead of fully round-tripping every pop.
+    retention_score, retention_pct, failed_pops = gain_retention_quality(high.tail(15), close.tail(15))
+    if retention_score <= -8:
+        flags.append("近期多次冲高回吐，涨幅留存差")
+
     # Background and trigger are intentionally separated.
-    background_score = float(np.clip(strong_score * 0.55 + structure_score * 1.05 + pullback_score * 0.45 + safe_pullback_score * 0.35 + pullback_volume_score, -30, 70))
+    background_score = float(np.clip(strong_score * 0.55 + structure_score * 1.05 + pullback_score * 0.45 + safe_pullback_score * 0.35 + pullback_volume_score + retention_score * 0.8, -30, 70))
     trigger_score = float(np.clip(turn_score * 1.5 + max(0, safe_pullback_score) * 0.25, 0, 35))
     risk_penalty = float(penalties + vol_penalty + liquidity_penalty)
     technical = float(np.clip(background_score + trigger_score - risk_penalty, -50, 100))
@@ -431,6 +438,8 @@ def analyze_daily(df: pd.DataFrame, code: str):
         "MA20": ma20,
         "20日高": h20,
         "20日低": l20,
+        "60日高": h60,
+        "60日低": l60,
         "距20日高%": from_h20,
         "区间位置%": range_pos,
         "量比20日": last_vol_ratio,
@@ -443,6 +452,9 @@ def analyze_daily(df: pd.DataFrame, code: str):
         "安全回调分": float(safe_pullback_score),
         "结构持续分": float(structure_score),
         "回调量价分": float(pullback_volume_score),
+        "涨幅保留分": float(retention_score),
+        "近10日冲高保留率%": retention_pct,
+        "冲高失败次数": int(failed_pops),
         "背景分": float(background_score),
         "触发分": float(trigger_score),
         "ATR14%": atr_pct,
@@ -455,6 +467,78 @@ def analyze_daily(df: pd.DataFrame, code: str):
         "技术总分": technical,
         "风险标签": "；".join(flags) if flags else "无明显弱势惩罚",
         "_df": d,
+    }
+
+
+def gain_retention_quality(high: pd.Series, close: pd.Series):
+    """Measure whether intraday rallies are retained into the close over the last 10 sessions."""
+    if len(close) < 12:
+        return 0.0, np.nan, 0
+    prev = close.shift(1)
+    excursion = (high - prev) / prev
+    close_gain = (close - prev) / prev
+    mask = excursion >= 0.02  # only count sessions that actually rallied >=2% intraday
+    fr = (close_gain[mask] / excursion[mask]).replace([np.inf, -np.inf], np.nan).dropna().tail(10)
+    if fr.empty:
+        return 0.0, np.nan, 0
+    fr = fr.clip(-1.0, 1.2)
+    avg = float(fr.mean())
+    failed = int((fr <= 0.15).sum())
+    if avg >= 0.65:
+        score = 12.0
+    elif avg >= 0.45:
+        score = 7.0
+    elif avg >= 0.25:
+        score = 2.0
+    elif avg < 0.05:
+        score = -10.0
+    else:
+        score = -4.0
+    if failed >= 3:
+        score -= 5.0
+    return float(np.clip(score, -15, 12)), avg * 100.0, failed
+
+
+def take_profit_targets(row, entry_price=None):
+    """Dynamic informational profit-taking references, not a guarantee or order instruction."""
+    current = safe_float(row.get("现价", np.nan))
+    entry = safe_float(entry_price) if entry_price is not None else current
+    if not math.isfinite(entry) or entry <= 0:
+        entry = current
+    atr_pct = safe_float(row.get("ATR14%", np.nan))
+    atr_abs = entry * atr_pct / 100.0 if math.isfinite(atr_pct) else entry * 0.03
+    atr_abs = max(atr_abs, entry * 0.015)
+    h20 = safe_float(row.get("20日高", np.nan))
+    h60 = safe_float(row.get("60日高", np.nan))
+    limit_up = safe_float(row.get("正常涨停价", np.nan))
+
+    # TP1: roughly 0.9 ATR / 2.5% above entry, but respect a nearby prior high as resistance.
+    base1 = entry + max(0.9 * atr_abs, entry * 0.025)
+    resist = sorted([x for x in [h20, h60] if math.isfinite(x) and x > entry * 1.01])
+    tp1 = base1
+    if resist and resist[0] < entry + 2.2 * atr_abs:
+        tp1 = min(tp1, resist[0] * 0.995)
+    tp1 = max(tp1, entry * 1.012)
+
+    # TP2: let a strong trend run about 1.8 ATR / 6%, but never pretend it can exceed the normal daily limit from the current session.
+    base2 = entry + max(1.8 * atr_abs, entry * 0.06)
+    higher_resist = [x for x in resist if x > tp1 * 1.01]
+    tp2 = base2
+    if higher_resist and higher_resist[0] < entry + 3.2 * atr_abs:
+        tp2 = min(tp2, higher_resist[0] * 0.995)
+    if math.isfinite(limit_up):
+        tp1 = min(tp1, limit_up * 0.995)
+        tp2 = min(tp2, limit_up * 0.995)
+    if tp2 <= tp1:
+        tp2 = min(tp1 + max(0.8 * atr_abs, entry * 0.025), limit_up * 0.995 if math.isfinite(limit_up) else float("inf"))
+
+    return {
+        "参考买入价": entry,
+        "第一止盈": float(tp1),
+        "强势续抱目标": float(tp2),
+        "第一止盈幅度%": pct(tp1, entry),
+        "第二目标幅度%": pct(tp2, entry),
+        "说明": "第一档优先考虑近期压力/约0.9ATR；若放量突破且不回落，再看第二档。遇到明显长上影、放量滞涨或跌回突破位，应重新评估，不机械死等目标价。",
     }
 
 
@@ -687,7 +771,7 @@ if rank is not None and not rank.empty:
         st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","背景分","触发分","安全回调分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### 排名表")
-    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","强势分","回踩分","转强分","安全回调分","风险总惩罚","新闻判断","风险标签"]
+    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","新闻判断","风险标签"]
     display_df = rank[show_cols].copy()
     num_cols = [c for c in show_cols if c not in ["代码","日文名","中文名","结论","预算可买一手","新闻判断","风险标签"]]
     display_df[num_cols] = display_df[num_cols].round(2)
@@ -712,6 +796,12 @@ if rank is not None and not rank.empty:
                     f"距支撑 {format_num(best['距支撑%'])}%｜ATR {format_num(best['ATR14%'])}%｜一手约 ¥{best['一手资金']:,.0f}｜资金友好 {format_num(best['资金友好分'])}。"
                 )
                 st.write(f"风险：{best['风险标签']}。新闻：{best['新闻判断']}。")
+                if str(best["结论"]).startswith("A｜"):
+                    tp = take_profit_targets(best, best["现价"])
+                    st.write(f"**若按当前价约 ¥{tp['参考买入价']:.0f} 作为参考入场：第一止盈约 ¥{tp['第一止盈']:.0f}（{tp['第一止盈幅度%']:.1f}%），强势续抱目标约 ¥{tp['强势续抱目标']:.0f}（{tp['第二目标幅度%']:.1f}%）。**")
+                    st.caption(tp["说明"])
+                else:
+                    st.caption("当前还不是‘已触发’A级买点，因此不把止盈目标包装成买入指令；等重新转强后再按实际入场价计算。")
 
     st.divider()
     st.subheader("单票诊断")
@@ -730,6 +820,19 @@ if rank is not None and not rank.empty:
     p2.metric("通常跌停价", format_num(row["正常跌停价"],1))
     p3.metric("制限值幅", f"±{format_num(row['制限值幅'],1)} 円")
     st.caption("涨跌停按东证通常制限值幅、以前一交易日基准价估算；连续无成交封板等情形可能触发次日扩大制限值幅，应以 JPX 当日公告为准。")
+
+    st.markdown("**🎯 动态止盈参考**")
+    default_entry = float(row["现价"]) if math.isfinite(safe_float(row["现价"])) else 0.0
+    entry_price = st.number_input("你的参考买入价 / 实际成本价", min_value=0.0, value=default_entry, step=1.0, key=f"entry_{selected}")
+    tp = take_profit_targets(row, entry_price if entry_price > 0 else row["现价"])
+    t1,t2,t3 = st.columns(3)
+    t1.metric("第一止盈", f"¥{tp['第一止盈']:.0f}", f"{tp['第一止盈幅度%']:.1f}%")
+    t2.metric("强势续抱目标", f"¥{tp['强势续抱目标']:.0f}", f"{tp['第二目标幅度%']:.1f}%")
+    t3.metric("冲高保留率", f"{format_num(row['近10日冲高保留率%'])}%", f"保留分 {format_num(row['涨幅保留分'])}")
+    st.caption(tp["说明"])
+    if row["冲高失败次数"] >= 3:
+        st.warning("这只票近期多次出现‘盘中冲高、收盘吐回去’，即使触及止盈附近，也更适合分批兑现，不宜默认它一定继续冲。")
+
     if selected in raw_map:
         st.plotly_chart(chart_for(selected, raw_map[selected], row["关键支撑"]), use_container_width=True)
     if selected in news_map:
@@ -762,7 +865,9 @@ with st.expander("评分怎么判"):
 **7. 资金友好度**：按日本现物常见100股一手估算 `现价×100`。只在 A/B 档候选里加最多10分；同样好时优先占用资金少的，弱票不会靠“便宜”翻身。  
 **8. 新闻催化**：只做佐证。业绩上修、受注、提携、自社株买等可加分；下修、增资、MS warrant 等扣分，但新闻不能覆盖技术面硬伤。  
 **9. 日股涨跌停**：按 JPX 通常制限值幅估算正常涨停/跌停；特殊扩大幅度日仍应以 JPX 公告为准。  
-**10. 大师点兵**：先把明显弱票排掉，再在前排合格候选中加权随机。随机承认短线的不确定性，但不替代纪律。
+**10. 涨幅保留率**：统计近期真正出现过盘中拉升的交易日，看收盘还能留下多少涨幅；能留住、收盘重心抬升加分，反复冲高全吐且失败次数多则扣分。  
+**11. 动态止盈**：对A级已触发候选，以实际买入价/参考价为基准，结合 ATR、20/60日前高压力位和通常涨停价，给“第一止盈 + 强势续抱目标”；不是统一死板+5%。  
+**12. 大师点兵**：先把明显弱票排掉，再在前排合格候选中加权随机。随机承认短线的不确定性，但不替代纪律。
 """)
 
 st.caption("数据说明：Yahoo Finance/yfinance 为免费公开数据入口，不是东京证券交易所官方低延迟行情。资金友好度按100股一手估算，仅作排序辅助。新闻来自 Google News RSS。东证通常制限值幅规则按 JPX 公布表计算；连续封板等特殊扩大情形不由免费行情自动识别。")
