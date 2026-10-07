@@ -14,7 +14,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="四时段强势回踩大师", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师 V12", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -101,7 +101,7 @@ def stock_label(code: str) -> str:
 
 
 RULES = [
-    "原本就强 + 回踩不破关键位 + 再次转强，才考虑买。",
+    "原本就强 + 健康回踩不破关键位 + 再次转强，才考虑买；同等质量优先上方空间更大、下方支撑更近的候选。",
     "连续创新低、收盘重心持续下移的弱票，直接重罚；不能因为“跌很多了”就自动抄底。",
     "有量不等于强：如果放量但价格不涨、冲高回落、收盘仍弱，视为派发/承接不足风险。",
     "类似 akippa：没有趋势、没有材料、没有惊喜，只靠突然暴拉，不追。",
@@ -180,6 +180,103 @@ def pullback_preference(day_pct, support_gap, from_h20, c, ma20):
     if math.isfinite(ma20) and c >= ma20:
         s += 4
     return float(np.clip(s, -25, 25))
+
+
+def pullback_quality_score(day_pct, r5, support_gap, from_h20, c, ma20, last_vol_ratio, structure_score):
+    """Score a *healthy* pullback, not mere cheapness.
+
+    Rewards: prior strength still intact, modest retreat, nearby support, contracting sell volume,
+    and enough room back to a recent high. Penalizes deep/accelerating declines and support breaks.
+    """
+    s = 0.0
+    # 1-day retreat: modest weakness is preferred; a plunge is not.
+    if math.isfinite(day_pct):
+        if -3.5 <= day_pct <= -0.8:
+            s += 10
+        elif -0.8 < day_pct <= 0.8:
+            s += 5
+        elif 0.8 < day_pct <= 3.0:
+            s += 1
+        elif day_pct > 5.0:
+            s -= 7
+        elif day_pct < -5.0:
+            s -= 11
+
+    # Multi-day trend must not be collapsing.
+    if math.isfinite(r5):
+        if 0 <= r5 <= 12:
+            s += 5
+        elif -3 <= r5 < 0:
+            s += 2
+        elif r5 < -7:
+            s -= 10
+
+    # Nearby support gives a defined downside reference.
+    if math.isfinite(support_gap):
+        if 0 <= support_gap <= 2.5:
+            s += 9
+        elif 2.5 < support_gap <= 5.5:
+            s += 5
+        elif support_gap < 0:
+            s -= 16
+        elif support_gap > 8:
+            s -= 5
+
+    # A useful pullback leaves room to the recent high, but very deep drawdowns are not 'healthy'.
+    if math.isfinite(from_h20):
+        draw = -from_h20
+        if 3 <= draw <= 12:
+            s += 9
+        elif 12 < draw <= 18:
+            s += 2
+        elif draw > 18:
+            s -= 10
+        elif draw < 1:
+            s -= 2
+
+    # Price should still respect the medium-term structure.
+    if math.isfinite(ma20):
+        if c >= ma20:
+            s += 6
+        elif c < ma20 * 0.98:
+            s -= 10
+
+    # Pullbacks on lighter volume are healthier than heavy-volume selloffs.
+    if math.isfinite(day_pct) and day_pct < 0 and math.isfinite(last_vol_ratio):
+        if last_vol_ratio <= 0.85:
+            s += 6
+        elif last_vol_ratio >= 1.5:
+            s -= 8
+
+    # Structural consistency is a gate, not a free pass.
+    if math.isfinite(structure_score):
+        if structure_score >= 8:
+            s += 5
+        elif structure_score <= -6:
+            s -= 7
+
+    return float(np.clip(s, -35, 40))
+
+
+def reward_risk_proxy(from_h20, support_gap, pullback_quality):
+    """Simple observable proxy: room to recent high versus distance to nearby support.
+
+    It is deliberately capped and only rewards already-healthy pullbacks.
+    """
+    if pullback_quality < 8 or not (math.isfinite(from_h20) and math.isfinite(support_gap)):
+        return 0.0, np.nan
+    upside = max(0.0, -from_h20)
+    downside = max(0.6, support_gap)
+    ratio = upside / downside if downside > 0 else np.nan
+    score = 0.0
+    if 3 <= upside <= 15:
+        if ratio >= 3.0:
+            score = 8.0
+        elif ratio >= 2.0:
+            score = 6.0
+        elif ratio >= 1.3:
+            score = 3.0
+    return score, ratio
 
 
 def affordability_score(price, budget=300000):
@@ -433,25 +530,26 @@ def mode_score(rank: pd.DataFrame, mode: str, budget: int):
     bg = r["背景分"].astype(float)
     trig = r["触发分"].astype(float)
     risk = r["风险总惩罚"].astype(float)
-    pull = r["安全回调分"].astype(float)
+    pull = r["回调质量分"].astype(float)
+    rr = r.get("空间盈亏比分", pd.Series(0.0, index=r.index)).astype(float)
     retain = r["涨幅保留分"].astype(float)
     cheap = r["资金友好分"].astype(float)
 
     if mode == "开盘前":
         # Yesterday's structure + news + affordable execution. Trigger is only a minor prior-session clue.
-        score = 0.58*bg + 0.22*np.maximum(pull,0) + 0.18*trig + 0.75*news - 0.72*risk
+        score = 0.52*bg + 0.48*np.maximum(pull,0) + 0.16*trig + 0.55*rr + 0.75*news - 0.72*risk
         r["模式说明"] = "盘前：重背景/支撑/隔夜新闻，少依赖尚未发生的盘中触发"
     elif mode == "盘中":
         intra = r.get("盘中量价分", pd.Series(0.0,index=r.index)).astype(float)
         short_struct = r.get("5分结构分", pd.Series(0.0,index=r.index)).astype(float)
-        score = 0.38*bg + 0.72*trig + 0.32*np.maximum(pull,0) + 0.82*intra + 0.55*short_struct + 0.45*news - 0.82*risk
+        score = 0.34*bg + 0.68*trig + 0.52*np.maximum(pull,0) + 0.42*rr + 0.82*intra + 0.55*short_struct + 0.45*news - 0.82*risk
         r["模式说明"] = "盘中：重实时转强/日内位置/量价，严惩追高和冲高回落"
     elif mode == "收盘前大引不成":
         close_strength = r.get("尾盘强度分", pd.Series(0.0,index=r.index)).astype(float)
         intra = r.get("盘中量价分", pd.Series(0.0,index=r.index)).astype(float)
         short_struct = r.get("5分结构分", pd.Series(0.0,index=r.index)).astype(float)
         # For overnight MOC, closing behavior dominates. Background must still be healthy; cheapness remains a tie-breaker.
-        score = 0.40*bg + 0.30*trig + 0.22*np.maximum(pull,0) + 1.18*close_strength + 0.20*intra + 0.45*short_struct + 0.48*news - 0.90*risk
+        score = 0.36*bg + 0.28*trig + 0.36*np.maximum(pull,0) + 0.30*rr + 1.18*close_strength + 0.20*intra + 0.45*short_struct + 0.48*news - 0.90*risk
         # Extra hard penalties for weak close / late dump / excessive daily acceleration.
         dayp = r.get("盘中涨跌%", r.get("日涨跌%", pd.Series(np.nan,index=r.index))).astype(float)
         posi = r.get("当日位置%", pd.Series(np.nan,index=r.index)).astype(float)
@@ -474,7 +572,7 @@ def mode_score(rank: pd.DataFrame, mode: str, budget: int):
         r["模式说明"] = "收盘前大引不成：先低价限价埋伏，未成交则收盘集合竞价转市价；重尾盘承接/日内位置/VWAP/最后30分钟量价，只筛值得隔夜的票"
     else:
         # Closing quality / retention matters most for next-day watchlist.
-        score = 0.48*bg + 0.42*trig + 0.38*np.maximum(pull,0) + 0.85*retain + 0.58*news - 0.76*risk
+        score = 0.43*bg + 0.38*trig + 0.55*np.maximum(pull,0) + 0.48*rr + 0.85*retain + 0.58*news - 0.76*risk
         r["模式说明"] = "收盘后：重收盘质量/涨幅留存/全天量价，筛明日候选"
 
     if "大引不成资格" not in r.columns:
@@ -485,7 +583,7 @@ def mode_score(rank: pd.DataFrame, mode: str, budget: int):
     score = pd.Series(score, index=r.index)
     score.loc[healthy] += cheap.loc[healthy]
     r["模式分"] = score.clip(-50,100)
-    r = r.sort_values(["模式分","背景分","触发分","一手资金"], ascending=[False,False,False,True]).reset_index(drop=True)
+    r = r.sort_values(["模式分","回调质量分","背景分","触发分","一手资金"], ascending=[False,False,False,False,True]).reset_index(drop=True)
     return r
 
 
@@ -658,6 +756,12 @@ def analyze_daily(df: pd.DataFrame, code: str):
         elif last_vol_ratio >= 1.5:
             pullback_volume_score -= 7
 
+    # Dedicated healthy-pullback score: this is intentionally more important than raw daily decline.
+    pullback_quality = pullback_quality_score(
+        r1, r5, support_gap, from_h20, c, ma20, last_vol_ratio, structure_score
+    )
+    rr_score, rr_ratio = reward_risk_proxy(from_h20, support_gap, pullback_quality)
+
     # Volatility / exhaustion risk.
     vol_penalty, atr_pct = volatility_risk(high, low, close)
     day_range = safe_float(high.iloc[-1] - low.iloc[-1])
@@ -682,8 +786,12 @@ def analyze_daily(df: pd.DataFrame, code: str):
         flags.append("近期多次冲高回吐，涨幅留存差")
 
     # Background and trigger are intentionally separated.
-    background_score = float(np.clip(strong_score * 0.55 + structure_score * 1.05 + pullback_score * 0.45 + safe_pullback_score * 0.35 + pullback_volume_score + retention_score * 0.8, -30, 70))
-    trigger_score = float(np.clip(turn_score * 1.5 + max(0, safe_pullback_score) * 0.25, 0, 35))
+    background_score = float(np.clip(
+        strong_score * 0.52 + structure_score * 1.00 + pullback_score * 0.30
+        + pullback_quality * 0.48 + rr_score * 0.55 + retention_score * 0.72,
+        -30, 70
+    ))
+    trigger_score = float(np.clip(turn_score * 1.5 + max(0, pullback_quality) * 0.18, 0, 35))
     risk_penalty = float(penalties + vol_penalty + liquidity_penalty)
     technical = float(np.clip(background_score + trigger_score - risk_penalty, -50, 100))
 
@@ -715,6 +823,9 @@ def analyze_daily(df: pd.DataFrame, code: str):
         "回踩分": float(pullback_score),
         "转强分": float(turn_score),
         "安全回调分": float(safe_pullback_score),
+        "回调质量分": float(pullback_quality),
+        "空间盈亏比分": float(rr_score),
+        "上方空间/支撑风险比": rr_ratio,
         "结构持续分": float(structure_score),
         "回调量价分": float(pullback_volume_score),
         "涨幅保留分": float(retention_score),
@@ -1101,14 +1212,14 @@ if rank is not None and not rank.empty:
             st.success(f"今日点兵：**{stock_label(pick)}**｜综合分 {pr['综合分']:.1f}｜安全回调分 {pr['安全回调分']:.1f}｜{pr['结论']}")
 
     st.markdown("#### 🛡️ 回调埋伏候选")
-    dip = rank[(rank["安全回调分"] >= 10) & (rank["背景分"] >= 22) & (rank["风险总惩罚"] < 18)].sort_values(["安全回调分","综合分"], ascending=False).head(8)
+    dip = rank[(rank["回调质量分"] >= 14) & (rank["背景分"] >= 22) & (rank["风险总惩罚"] < 18)].sort_values(["回调质量分","空间盈亏比分","综合分"], ascending=False).head(8)
     if dip.empty:
         st.caption("今天没有满足‘强势 + 小回调 + 守支撑’的明显候选。")
     else:
-        st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","背景分","触发分","安全回调分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
+        st.dataframe(dip[["代码","日文名","中文名","现价","一手资金","日涨跌%","20日%","距支撑%","距20日高%","回调质量分","上方空间/支撑风险比","背景分","触发分","综合分","结论"]].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### 排名表")
-    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","新闻判断","风险标签"]
+    show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","回调质量分","上方空间/支撑风险比","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","新闻判断","风险标签"]
     if mode in ["盘中", "收盘前大引不成"]:
         extras = ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]
         if mode == "收盘前大引不成":
