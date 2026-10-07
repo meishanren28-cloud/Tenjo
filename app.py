@@ -14,7 +14,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="三时段强势回踩大师", page_icon="🎲", layout="wide")
+st.set_page_config(page_title="四时段强势回踩大师", page_icon="🎲", layout="wide")
 
 JST = timezone(timedelta(hours=9))
 
@@ -113,12 +113,14 @@ RULES = [
     "便宜只做同档候选的加分项，绝不能让低价弱票因为便宜就越过结构更好的强票。",
     "重视涨幅保留率：冲高后能把大部分涨幅留到收盘、连续几天收盘重心抬高，加分；反复冲高全吐、收盘越来越低，扣分。",
     "一旦给出可买/推荐，必须同时给动态止盈参考：结合买入价、ATR、近期前高/压力位和通常涨停价，而不是统一写死+5%。",
+    "收盘前大引不成只挑隔夜质量：尾盘站得住、接近日高但不过热、最后30分钟不跳水、最好站在VWAP上方且有合理尾盘量能；尾盘拉一根骗炮或当天已经失控加速的不追。",
 ]
 
 MODE_DESCRIPTIONS = {
     "开盘前": "用昨收/历史结构 + 隔夜新闻做盘前筛选。重点找今天值得盯的票，不把尚未发生的盘中转强当成既成事实。",
     "盘中": "重点判断现在是否真的转强：实时价格、当日高低位置、量价、冲高回落与追高风险权重最高。",
     "收盘后预测明天": "重点看收盘质量、全天涨幅保留、量能、关键位是否守住，以及新闻催化，用来挑明天优先观察/埋伏的票。",
+    "收盘前大引不成": "专门筛选适合收盘集合竞价前考虑隔夜持有的候选：重尾盘承接、收盘位置、VWAP、最后30分钟动量与量能，同时严惩冲高回落、尾盘跳水、过度加速和弱趋势。",
 }
 
 POSITIVE_KW = [
@@ -275,7 +277,8 @@ def extract_intraday(data, code):
 
 def apply_intraday_features(rank, intraday_batch):
     rank = rank.copy()
-    for col, default in [("盘中现价", np.nan),("盘中涨跌%", np.nan),("当日位置%", np.nan),("距日高%", np.nan),("盘中量价分",0.0)]:
+    for col, default in [("盘中现价", np.nan),("盘中涨跌%", np.nan),("当日位置%", np.nan),("距日高%", np.nan),("盘中量价分",0.0),
+                         ("尾盘30分钟%", np.nan),("尾盘量能倍率", np.nan),("VWAP偏离%", np.nan),("尾盘强度分",0.0),("日内涨幅保留率%", np.nan)]:
         rank[col] = default
     for idx, row in rank.iterrows():
         code = str(row["代码"])
@@ -306,11 +309,66 @@ def apply_intraday_features(rank, intraday_batch):
             if pos >= 75: score += 7
             elif pos <= 25: score -= 7
         if math.isfinite(from_hi) and from_hi < -3: score -= 4
+
+        # Close-auction / overnight features from 5-minute bars.
+        closes = d["Close"].dropna()
+        vols = d["Volume"].fillna(0) if "Volume" in d.columns else pd.Series(dtype=float)
+        tail_ret = np.nan
+        if len(closes) >= 7:
+            tail_ret = pct(safe_float(closes.iloc[-1]), safe_float(closes.iloc[-7]))
+        tail_vol_ratio = np.nan
+        if len(vols) >= 12 and safe_float(vols.iloc[-6:].mean(), 0) >= 0:
+            prior_mean = safe_float(vols.iloc[:-6].tail(18).mean(), np.nan)
+            tail_mean = safe_float(vols.iloc[-6:].mean(), np.nan)
+            if math.isfinite(prior_mean) and prior_mean > 0 and math.isfinite(tail_mean):
+                tail_vol_ratio = tail_mean / prior_mean
+        vwap = np.nan
+        if "Volume" in d.columns and d["Volume"].fillna(0).sum() > 0:
+            typical = (d["High"].fillna(d["Close"]) + d["Low"].fillna(d["Close"]) + d["Close"]) / 3.0
+            vwap = safe_float((typical * d["Volume"].fillna(0)).sum() / d["Volume"].fillna(0).sum())
+        vwap_gap = pct(c, vwap) if math.isfinite(vwap) else np.nan
+        retention = np.nan
+        if math.isfinite(base) and math.isfinite(hi) and hi > base:
+            retention = (c - base) / (hi - base) * 100.0
+
+        close_score = 0.0
+        # Prefer a firm close, but avoid buying a stock that is already in uncontrolled acceleration.
+        if math.isfinite(pos):
+            if 72 <= pos <= 96: close_score += 10
+            elif pos > 96: close_score += 5
+            elif pos < 45: close_score -= 10
+        if math.isfinite(tail_ret):
+            if 0.15 <= tail_ret <= 1.8: close_score += 8
+            elif -0.25 <= tail_ret < 0.15: close_score += 2
+            elif tail_ret < -1.2: close_score -= 12
+            elif tail_ret > 2.5: close_score -= 5
+        if math.isfinite(vwap_gap):
+            if 0 <= vwap_gap <= 3.0: close_score += 7
+            elif vwap_gap < -1.0: close_score -= 8
+            elif vwap_gap > 5.0: close_score -= 5
+        if math.isfinite(tail_vol_ratio):
+            if 1.05 <= tail_vol_ratio <= 2.8: close_score += 6
+            elif tail_vol_ratio > 4.0: close_score -= 3
+        if math.isfinite(retention):
+            if 60 <= retention <= 105: close_score += 6
+            elif retention < 30: close_score -= 8
+        if math.isfinite(dp):
+            if -1.0 <= dp <= 4.5: close_score += 5
+            elif dp > 8.0: close_score -= 10
+            elif dp < -3.5: close_score -= 9
+        if math.isfinite(from_hi) and from_hi < -3.0:
+            close_score -= 7
+
         rank.at[idx,"盘中现价"] = c
         rank.at[idx,"盘中涨跌%"] = dp
         rank.at[idx,"当日位置%"] = pos
         rank.at[idx,"距日高%"] = from_hi
         rank.at[idx,"盘中量价分"] = float(np.clip(score,-20,20))
+        rank.at[idx,"尾盘30分钟%"] = tail_ret
+        rank.at[idx,"尾盘量能倍率"] = tail_vol_ratio
+        rank.at[idx,"VWAP偏离%"] = vwap_gap
+        rank.at[idx,"日内涨幅保留率%"] = retention
+        rank.at[idx,"尾盘强度分"] = float(np.clip(close_score,-30,35))
     return rank
 
 
@@ -336,10 +394,38 @@ def mode_score(rank: pd.DataFrame, mode: str, budget: int):
         intra = r.get("盘中量价分", pd.Series(0.0,index=r.index)).astype(float)
         score = 0.38*bg + 0.72*trig + 0.32*np.maximum(pull,0) + 1.0*intra + 0.45*news - 0.82*risk
         r["模式说明"] = "盘中：重实时转强/日内位置/量价，严惩追高和冲高回落"
+    elif mode == "收盘前大引不成":
+        close_strength = r.get("尾盘强度分", pd.Series(0.0,index=r.index)).astype(float)
+        intra = r.get("盘中量价分", pd.Series(0.0,index=r.index)).astype(float)
+        # For overnight MOC, closing behavior dominates. Background must still be healthy; cheapness remains a tie-breaker.
+        score = 0.40*bg + 0.30*trig + 0.22*np.maximum(pull,0) + 1.18*close_strength + 0.28*intra + 0.48*news - 0.90*risk
+        # Extra hard penalties for weak close / late dump / excessive daily acceleration.
+        dayp = r.get("盘中涨跌%", r.get("日涨跌%", pd.Series(np.nan,index=r.index))).astype(float)
+        posi = r.get("当日位置%", pd.Series(np.nan,index=r.index)).astype(float)
+        tail = r.get("尾盘30分钟%", pd.Series(np.nan,index=r.index)).astype(float)
+        score = pd.Series(score, index=r.index)
+        score.loc[(posi < 40) | (tail < -1.2)] -= 14
+        score.loc[dayp > 9] -= 10
+        score.loc[(r["结论"] == "回避")] -= 20
+        r["大引不成资格"] = (
+            r["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
+            & (r["背景分"] >= 20)
+            & (r["风险总惩罚"] < 18)
+            & (close_strength >= 12)
+            & (posi >= 65)
+            & (tail >= -0.30)
+            & (dayp <= 8.0)
+            & (dayp >= -2.5)
+        )
+        score.loc[~r["大引不成资格"]] -= 18
+        r["模式说明"] = "收盘前大引不成：先低价限价埋伏，未成交则收盘集合竞价转市价；重尾盘承接/日内位置/VWAP/最后30分钟量价，只筛值得隔夜的票"
     else:
         # Closing quality / retention matters most for next-day watchlist.
         score = 0.48*bg + 0.42*trig + 0.38*np.maximum(pull,0) + 0.85*retain + 0.58*news - 0.76*risk
         r["模式说明"] = "收盘后：重收盘质量/涨幅留存/全天量价，筛明日候选"
+
+    if "大引不成资格" not in r.columns:
+        r["大引不成资格"] = False
 
     # Cheapness is a tie-breaker only for healthy candidates, never a rescue factor.
     healthy = r["结论"].isin(["A｜强背景+已触发", "B+｜好候选，等转强", "B｜观察"])
@@ -828,8 +914,8 @@ def chart_for(code, raw_df, support=None):
 
 
 # ---------- UI ----------
-st.title("🎲 三时段强势回踩资金友好大师")
-st.caption("开盘前 / 盘中 / 收盘后预测明天 · 三套侧重不同的评分 · 股票池固定 72 只 · 免费行情可能延迟")
+st.title("🎲 四时段强势回踩资金友好大师")
+st.caption("开盘前 / 盘中 / 收盘前大引不成 / 收盘后预测明天 · 四套侧重不同的评分 · 股票池固定 72 只 · 免费行情可能延迟")
 
 with st.expander("先看核心纪律（网站会强制执行）", expanded=True):
     for x in RULES:
@@ -854,7 +940,7 @@ if "news" not in st.session_state:
     st.session_state.news = None
 
 st.markdown("### 🕒 分析时段")
-mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘后预测明天"], horizontal=True)
+mode = st.radio("你现在是在什么时候选股？", ["开盘前", "盘中", "收盘前大引不成", "收盘后预测明天"], horizontal=True)
 st.info(MODE_DESCRIPTIONS[mode])
 
 st.markdown("### 💴 资金偏好")
@@ -866,7 +952,7 @@ with left:
     if st.button("🚀 扫描 72 只股票", type="primary", use_container_width=True):
         with st.spinner("正在拉取行情、计算趋势，并对前排候选精查新闻…"):
             rank, raw, news = scan_all(STOCK_CODES)
-            if mode == "盘中":
+            if mode in ["盘中", "收盘前大引不成"]:
                 intra = download_intraday(tuple(STOCK_CODES))
                 rank = apply_intraday_features(rank, intra)
             st.session_state.scan = rank
@@ -883,12 +969,12 @@ news_map = st.session_state.news or {}
 if rank is not None and not rank.empty:
     rank = rank.copy()
     # If user changed mode after scanning, reuse daily scan and fetch intraday only when needed.
-    if mode == "盘中" and "盘中量价分" not in rank.columns:
+    if mode in ["盘中", "收盘前大引不成"] and "盘中量价分" not in rank.columns:
         intra = download_intraday(tuple(STOCK_CODES))
         rank = apply_intraday_features(rank, intra)
     rank = mode_score(rank, mode, budget)
     rank["综合分"] = rank["模式分"]  # backward-compatible display name
-    heading = {"开盘前":"今天开盘前优先盯谁", "盘中":"盘中现在优先看谁", "收盘后预测明天":"明天优先观察谁"}[mode]
+    heading = {"开盘前":"今天开盘前优先盯谁", "盘中":"盘中现在优先看谁", "收盘前大引不成":"收盘前大引不成优先候选", "收盘后预测明天":"明天优先观察谁"}[mode]
     st.subheader(heading)
     top = rank.iloc[0]
     c1,c2,c3,c4,c5 = st.columns(5)
@@ -898,6 +984,22 @@ if rank is not None and not rank.empty:
     c4.metric("一手资金", f"¥{top['一手资金']:,.0f}" if math.isfinite(top['一手资金']) else "—")
     c5.metric("结论", top["结论"])
     st.info(f"第一名 {stock_label(str(top['代码']))}｜{top['模式说明']}｜风险：{top['风险标签']}；新闻：{top['新闻判断']}。第一名也不是收益保证。")
+
+    if mode == "收盘前大引不成":
+        st.markdown("#### 🌙 大引不成隔夜资格")
+        moc = rank[rank["大引不成资格"] == True].copy()
+        if moc.empty:
+            st.error("今天没有通过大引不成硬门槛的股票：宁可不隔夜，也不为了下单硬凑一只。")
+        else:
+            best_moc = moc.iloc[0]
+            st.success(f"优先候选：**{stock_label(str(best_moc['代码']))}**｜大引不成分 {best_moc['综合分']:.1f}｜尾盘强度 {best_moc['尾盘强度分']:.1f}")
+            mc1,mc2,mc3,mc4,mc5 = st.columns(5)
+            mc1.metric("尾盘30分钟", f"{format_num(best_moc['尾盘30分钟%'])}%")
+            mc2.metric("当日位置", f"{format_num(best_moc['当日位置%'])}%")
+            mc3.metric("VWAP偏离", f"{format_num(best_moc['VWAP偏离%'])}%")
+            mc4.metric("尾盘量能", f"{format_num(best_moc['尾盘量能倍率'])}x")
+            mc5.metric("涨幅留存", f"{format_num(best_moc['日内涨幅保留率%'])}%")
+            st.caption("思路：先挂你愿意接的低价限价；若盘中未成交，再由‘不成’在收盘集合竞价转为市价。这里只筛隔夜质量，不保证次日高开。免费5分钟行情可能延迟，收盘前务必再看券商盘口。")
 
     # Fun layer: rules first, randomness second. Weak/broken names are never admitted to the draw.
     st.markdown("#### 🎲 大师点兵：先过纪律，再交给一点运气")
@@ -928,8 +1030,11 @@ if rank is not None and not rank.empty:
 
     st.markdown("#### 排名表")
     show_cols = ["代码","日文名","中文名","结论","综合分","现价","一手资金","预算可买一手","资金友好分","背景分","触发分","ATR14%","日涨跌%","5日%","20日%","距20日高%","距支撑%","量比20日","结构持续分","涨幅保留分","近10日冲高保留率%","冲高失败次数","强势分","回踩分","转强分","安全回调分","风险总惩罚","新闻判断","风险标签"]
-    if mode == "盘中":
-        for extra in ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]:
+    if mode in ["盘中", "收盘前大引不成"]:
+        extras = ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]
+        if mode == "收盘前大引不成":
+            extras += ["大引不成资格","尾盘30分钟%","尾盘量能倍率","VWAP偏离%","日内涨幅保留率%","尾盘强度分"]
+        for extra in extras:
             if extra in rank.columns:
                 show_cols.insert(6, extra)
     display_df = rank[show_cols].copy()
@@ -1011,13 +1116,14 @@ else:
 with st.expander("股票池（72只）"):
     st.dataframe(pd.DataFrame(STOCKS, columns=["代码","日文正式/常用名","中文译名"]), use_container_width=True, hide_index=True)
 
-with st.expander("三个时段为什么分开算"):
+with st.expander("四个时段为什么分开算"):
     st.markdown("""
 - **开盘前**：重昨收结构、趋势背景、回踩位置和隔夜新闻；触发分只作参考，因为今天还没真正走出来。  
 - **盘中**：重实时重新转强、当日位置、距日高、冲高回落和追高风险；这是最严格的“现在能不能买”。  
+- **收盘前大引不成**：专门服务收盘集合竞价前的隔夜候选。重尾盘30分钟动量、尾盘量能、VWAP、日内位置和涨幅留存；尾盘跳水、冲高全吐、当天已经失控加速会被重罚。  
 - **收盘后预测明天**：重收盘质量、涨幅保留、全天量价和关键位是否守住；用于做第二天观察清单。  
 
-同一只票在三个模式得分不同是正常的。**资金友好度始终只作为合格候选之间的加分项，不会救活弱票。**
+同一只票在四个模式得分不同是正常的。**资金友好度始终只作为合格候选之间的加分项，不会救活弱票。**
 """)
 
 with st.expander("评分怎么判"):
@@ -1035,7 +1141,8 @@ with st.expander("评分怎么判"):
 **9. 日股涨跌停**：按 JPX 通常制限值幅估算正常涨停/跌停；特殊扩大幅度日仍应以 JPX 公告为准。  
 **10. 涨幅保留率**：统计近期真正出现过盘中拉升的交易日，看收盘还能留下多少涨幅；能留住、收盘重心抬升加分，反复冲高全吐且失败次数多则扣分。  
 **11. 动态止盈**：对A级已触发候选，以实际买入价/参考价为基准，结合 ATR、20/60日前高压力位和通常涨停价，给“第一止盈 + 强势续抱目标”；不是统一死板+5%。  
-**12. 大师点兵**：先把明显弱票排掉，再在前排合格候选中加权随机。随机承认短线的不确定性，但不替代纪律。
+**12. 大师点兵**：先把明显弱票排掉，再在前排合格候选中加权随机。随机承认短线的不确定性，但不替代纪律。  
+**13. 收盘前大引不成**：只在尾盘结构健康时考虑隔夜。优先“强背景 + 价格在日内高位区但没有失控加速 + 最后30分钟不跳水 + 站在VWAP上方 + 尾盘量能温和增强 + 涨幅留存较高”的股票；尾盘突然直线拉升、离VWAP过远、当天涨幅过大或冲高回落明显则扣分。
 """)
 
 st.caption("数据说明：Yahoo Finance/yfinance 为免费公开数据入口，不是东京证券交易所官方低延迟行情。资金友好度按100股一手估算，仅作排序辅助。新闻来自 Google News RSS。东证通常制限值幅规则按 JPX 公布表计算；连续封板等特殊扩大情形不由免费行情自动识别。")
