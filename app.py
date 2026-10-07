@@ -278,6 +278,7 @@ def extract_intraday(data, code):
 def apply_intraday_features(rank, intraday_batch):
     rank = rank.copy()
     for col, default in [("盘中现价", np.nan),("盘中涨跌%", np.nan),("当日位置%", np.nan),("距日高%", np.nan),("盘中量价分",0.0),
+                         ("5分MA20", np.nan),("距5分MA20%", np.nan),("5分MA20斜率%", np.nan),("5分结构分",0.0),
                          ("尾盘30分钟%", np.nan),("尾盘量能倍率", np.nan),("VWAP偏离%", np.nan),("尾盘强度分",0.0),("日内涨幅保留率%", np.nan)]:
         rank[col] = default
     for idx, row in rank.iterrows():
@@ -309,6 +310,52 @@ def apply_intraday_features(rank, intraday_batch):
             if pos >= 75: score += 7
             elif pos <= 25: score -= 7
         if math.isfinite(from_hi) and from_hi < -3: score -= 4
+
+        # Short-cycle structure from ACTUAL 5-minute OHLCV bars.
+        # 5m MA20 = rolling mean of the last 20 five-minute closes (~100 trading minutes).
+        ma20_5m = np.nan
+        ma20_gap = np.nan
+        ma20_slope = np.nan
+        structure_score = 0.0
+        closes_all = d["Close"].dropna()
+        if len(closes_all) >= 20:
+            ma20_series = closes_all.rolling(20).mean()
+            ma20_5m = safe_float(ma20_series.iloc[-1])
+            if math.isfinite(ma20_5m) and ma20_5m > 0:
+                ma20_gap = pct(c, ma20_5m)
+            # Compare current 5m MA20 with five bars earlier to measure short-cycle slope.
+            if len(ma20_series.dropna()) >= 6:
+                ma20_prev = safe_float(ma20_series.dropna().iloc[-6])
+                if math.isfinite(ma20_prev) and ma20_prev > 0:
+                    ma20_slope = pct(ma20_5m, ma20_prev)
+            if math.isfinite(ma20_gap):
+                if 0 <= ma20_gap <= 2.5: structure_score += 5
+                elif ma20_gap < -1.0: structure_score -= 6
+                elif ma20_gap > 4.0: structure_score -= 3
+            if math.isfinite(ma20_slope):
+                if ma20_slope > 0.15: structure_score += 4
+                elif ma20_slope < -0.15: structure_score -= 4
+
+        # Higher-high / higher-low check using two adjacent 3-bar windows near the latest price.
+        # This is deliberately simple and transparent; it is not inferred from names or news.
+        if len(d) >= 6 and "High" in d.columns and "Low" in d.columns:
+            recent = d.dropna(subset=["High","Low"]).tail(6)
+            if len(recent) == 6:
+                h1 = safe_float(recent["High"].iloc[:3].max())
+                h2 = safe_float(recent["High"].iloc[3:].max())
+                l1 = safe_float(recent["Low"].iloc[:3].min())
+                l2 = safe_float(recent["Low"].iloc[3:].min())
+                if all(math.isfinite(x) for x in [h1,h2,l1,l2]):
+                    if h2 > h1 and l2 > l1:
+                        structure_score += 7
+                    elif h2 < h1 and l2 < l1:
+                        structure_score -= 7
+                    elif l2 > l1:
+                        structure_score += 2
+                    elif l2 < l1:
+                        structure_score -= 2
+
+        score += structure_score
 
         # Close-auction / overnight features from 5-minute bars.
         closes = d["Close"].dropna()
@@ -363,7 +410,11 @@ def apply_intraday_features(rank, intraday_batch):
         rank.at[idx,"盘中涨跌%"] = dp
         rank.at[idx,"当日位置%"] = pos
         rank.at[idx,"距日高%"] = from_hi
-        rank.at[idx,"盘中量价分"] = float(np.clip(score,-20,20))
+        rank.at[idx,"盘中量价分"] = float(np.clip(score,-25,25))
+        rank.at[idx,"5分MA20"] = ma20_5m
+        rank.at[idx,"距5分MA20%"] = ma20_gap
+        rank.at[idx,"5分MA20斜率%"] = ma20_slope
+        rank.at[idx,"5分结构分"] = float(np.clip(structure_score,-15,15))
         rank.at[idx,"尾盘30分钟%"] = tail_ret
         rank.at[idx,"尾盘量能倍率"] = tail_vol_ratio
         rank.at[idx,"VWAP偏离%"] = vwap_gap
@@ -392,13 +443,15 @@ def mode_score(rank: pd.DataFrame, mode: str, budget: int):
         r["模式说明"] = "盘前：重背景/支撑/隔夜新闻，少依赖尚未发生的盘中触发"
     elif mode == "盘中":
         intra = r.get("盘中量价分", pd.Series(0.0,index=r.index)).astype(float)
-        score = 0.38*bg + 0.72*trig + 0.32*np.maximum(pull,0) + 1.0*intra + 0.45*news - 0.82*risk
+        short_struct = r.get("5分结构分", pd.Series(0.0,index=r.index)).astype(float)
+        score = 0.38*bg + 0.72*trig + 0.32*np.maximum(pull,0) + 0.82*intra + 0.55*short_struct + 0.45*news - 0.82*risk
         r["模式说明"] = "盘中：重实时转强/日内位置/量价，严惩追高和冲高回落"
     elif mode == "收盘前大引不成":
         close_strength = r.get("尾盘强度分", pd.Series(0.0,index=r.index)).astype(float)
         intra = r.get("盘中量价分", pd.Series(0.0,index=r.index)).astype(float)
+        short_struct = r.get("5分结构分", pd.Series(0.0,index=r.index)).astype(float)
         # For overnight MOC, closing behavior dominates. Background must still be healthy; cheapness remains a tie-breaker.
-        score = 0.40*bg + 0.30*trig + 0.22*np.maximum(pull,0) + 1.18*close_strength + 0.28*intra + 0.48*news - 0.90*risk
+        score = 0.40*bg + 0.30*trig + 0.22*np.maximum(pull,0) + 1.18*close_strength + 0.20*intra + 0.45*short_struct + 0.48*news - 0.90*risk
         # Extra hard penalties for weak close / late dump / excessive daily acceleration.
         dayp = r.get("盘中涨跌%", r.get("日涨跌%", pd.Series(np.nan,index=r.index))).astype(float)
         posi = r.get("当日位置%", pd.Series(np.nan,index=r.index)).astype(float)
@@ -1033,7 +1086,7 @@ if rank is not None and not rank.empty:
     if mode in ["盘中", "收盘前大引不成"]:
         extras = ["盘中现价","盘中涨跌%","当日位置%","距日高%","盘中量价分"]
         if mode == "收盘前大引不成":
-            extras += ["大引不成资格","尾盘30分钟%","尾盘量能倍率","VWAP偏离%","日内涨幅保留率%","尾盘强度分"]
+            extras += ["大引不成资格","5分MA20","距5分MA20%","5分MA20斜率%","5分结构分","尾盘30分钟%","尾盘量能倍率","VWAP偏离%","日内涨幅保留率%","尾盘强度分"]
         for extra in extras:
             if extra in rank.columns:
                 show_cols.insert(6, extra)
@@ -1142,7 +1195,8 @@ with st.expander("评分怎么判"):
 **10. 涨幅保留率**：统计近期真正出现过盘中拉升的交易日，看收盘还能留下多少涨幅；能留住、收盘重心抬升加分，反复冲高全吐且失败次数多则扣分。  
 **11. 动态止盈**：对A级已触发候选，以实际买入价/参考价为基准，结合 ATR、20/60日前高压力位和通常涨停价，给“第一止盈 + 强势续抱目标”；不是统一死板+5%。  
 **12. 大师点兵**：先把明显弱票排掉，再在前排合格候选中加权随机。随机承认短线的不确定性，但不替代纪律。  
-**13. 收盘前大引不成**：只在尾盘结构健康时考虑隔夜。优先“强背景 + 价格在日内高位区但没有失控加速 + 最后30分钟不跳水 + 站在VWAP上方 + 尾盘量能温和增强 + 涨幅留存较高”的股票；尾盘突然直线拉升、离VWAP过远、当天涨幅过大或冲高回落明显则扣分。
+**13. 盘中短周期结构**：只使用实际抓到的 5 分钟 OHLCV 计算。增加 5分钟MA20（约100分钟均价）、MA20短期斜率，以及最近6根5分钟K线的高点/低点是否抬高。价格在上行MA20附近、且高低点同步抬高加分；跌破下行MA20、且高低点同步下移扣分。数据取不到就显示为空，不补猜。  
+**14. 收盘前大引不成**：只在尾盘结构健康时考虑隔夜。优先“强背景 + 价格在日内高位区但没有失控加速 + 最后30分钟不跳水 + 站在VWAP上方 + 5分钟结构不弱 + 尾盘量能温和增强 + 涨幅留存较高”的股票；尾盘突然直线拉升、离VWAP过远、当天涨幅过大或冲高回落明显则扣分。
 """)
 
 st.caption("数据说明：Yahoo Finance/yfinance 为免费公开数据入口，不是东京证券交易所官方低延迟行情。资金友好度按100股一手估算，仅作排序辅助。新闻来自 Google News RSS。东证通常制限值幅规则按 JPX 公布表计算；连续封板等特殊扩大情形不由免费行情自动识别。")

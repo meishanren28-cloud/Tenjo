@@ -74,11 +74,3 @@
 1. 把 `app.py`、`requirements.txt`、`README.md` 上传到 GitHub 仓库根目录。
 2. 在 Streamlit Community Cloud 选择该仓库。
 3. Main file path 填 `app.py`。
-
-
-## V9：盘中短周期结构
-- 盘中/收盘前模式增加实际 5 分钟 OHLCV 计算的 5分钟MA20。
-- 显示当前价距 5分钟MA20 的偏离、5分钟MA20斜率。
-- 检查最近6根5分钟K线的高点/低点是否抬高，形成短周期结构分。
-- 数据来自 yfinance/Yahoo Finance 的 5m 数据；抓不到时留空，不用估算值补齐。
-- 日线 MA5/MA20 仍保留用于中短期大方向；5分钟结构只负责判断盘中时机。
